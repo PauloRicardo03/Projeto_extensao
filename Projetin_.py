@@ -155,7 +155,7 @@ while True:
 
         cv2.putText(imagem, f"FPS: {taxa_fps:.1f}", (imagem.shape[1] - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
 
-    cv2.imshow('Analise via Celular', imagem)  # mostra o video na tela do pc
+    cv2.imshow('Analise via Celular:', imagem)  # mostra o video na tela do pc
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
 
