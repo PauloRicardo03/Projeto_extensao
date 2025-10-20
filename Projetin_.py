@@ -92,7 +92,7 @@ while True:
         media_G_recente=media_BGR[1]
         media_R_recente=media_BGR[2]
 
-        vermelho=20 # nivel de vermelho minimo
+        vermelho=60 # nivel de vermelho minimo
 
         dedo_na_camera= (media_R_recente > media_G_recente + vermelho and media_R_recente > media_B_recente + vermelho) #confere se as duas contas dão TRUE e retorna pra variavel dedo_na_camera, a variavel "vermelho" quando soma com a media_G_recente fala quanto a media_R_recente tem que ser maior pra ser considerada valida 
 
@@ -100,7 +100,7 @@ while True:
             # normaliza o buffer_R pra não levar em consideração o tom vermelho que mais aparece
             Rnorm = np.array(buffer_R)/(np.mean (buffer_R) + 1e-9)
             Gnorm = np.array(buffer_G)/(np.mean(buffer_G) + 1e-9)
-            # normaliza o buffer_G pra não levar em consideração o tom verde que mais aparece
+            # normaliza o buffer_G pra não levar em consideração o tom verde que maqqis aparece
             Bnorm = np.array(buffer_B)/(np.mean(buffer_B) + 1e-9)
             # normaliza o buffer_B pra não levar em consideração o tom azul que mais aparece
             S1 = Gnorm-Bnorm  # aqui ele ainda tem o pulso e o ruido
@@ -155,7 +155,7 @@ while True:
 
         cv2.putText(imagem, f"FPS: {taxa_fps:.1f}", (imagem.shape[1] - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
 
-    cv2.imshow('Analise via Celular', imagem)  # mostra o video na tela do pc
+    cv2.imshow('Analise via Celular:', imagem)  # mostra o video na tela do pc
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
 
