@@ -42,13 +42,13 @@ while True:
         contador_frames = 0
         tempo_espera = time.time()
 
-    (altura,largura)=imagem.shape[:2]# a variavel shape retorna altura, largura e canais de cores (nessa sequencia), mas como só preciso dos dois primeiros o [:2] pega ate o indice 2 ( mas mas não inclui o indice 2)
+    (largura,altura)=imagem.shape[:2]# a variavel shape retorna altura, largura e canais de cores (nessa sequencia), mas como só preciso dos dois primeiros o [:2] pega ate o indice 2 ( mas mas não inclui o indice 2)
     
-    tamanho_roi=int(altura * 0.5) #faz o tamanho do ROI ser proporcional a resolução do video, se baseando na altura
+    tamanho_roi=int(largura * 0.5) #faz o tamanho do ROI ser proporcional a resolução do video, se baseando na altura
 
 
-    x_inicio=(altura-tamanho_roi)//2 + 380 #fala onde no eixo x o retangulo vai iniciar dividindo a imagem em duas partes iguais 
-    y_inicio=(altura-tamanho_roi)//2  #fala onde no eixo y o retangulo vai iniciar
+    x_inicio=(altura-tamanho_roi)//2  #fala onde no eixo x o retangulo vai iniciar dividindo a imagem em duas partes iguais 
+    y_inicio=(largura-tamanho_roi)//2  #fala onde no eixo y o retangulo vai iniciar
     x_fim=x_inicio+tamanho_roi #calcula onde o ROI vai terminar no eixo x
     y_fim=y_inicio+tamanho_roi#calcula onde o ROI vai terminar no eixo y
 
@@ -57,8 +57,8 @@ while True:
     
     x_inicio = max(0, x_inicio)#serve pro ROI não ficar pra fora da imagem, se o x_inicio for um numero negativo pra não vazar da imagem o "max" vai escolher o valor 0
     y_inicio = max(0, y_inicio)
-    x_fim = min(largura, x_fim)#tambem serve pro ROI não ficar pra fora da imagem, se o x_fim for um numero maior que a largura pra não vazar da imagem o "min" vai escolher o valor da largura
-    y_fim = min(altura, y_fim)
+    x_fim = min(altura, x_fim)#tambem serve pro ROI não ficar pra fora da imagem, se o x_fim for um numero maior que a largura pra não vazar da imagem o "min" vai escolher o valor da largura
+    y_fim = min(largura, y_fim)
     
 
     if x_fim > x_inicio and y_fim > y_inicio: # serve pra garantir que o ROI seja REALMENTE um retangulo
