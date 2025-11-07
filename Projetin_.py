@@ -6,8 +6,8 @@ from scipy.signal import butter, filtfilt, find_peaks
 # filtfilt aplica um filtro (que tem que criar) no sinal
 # find_peaks acha os picos de dados
 
-Tamanho_tela = 150  # analisa os 250 frames
-url = "http://192.168.100.35:8080/video"  # ip do aplicativo
+Tamanho_tela = 100  # analisa os 250 frames
+url = "http://192.168.100.49:8080/video"  # ip do aplicativo
 cap = cv2.VideoCapture(url)  # pega o sinal da camera
 if not cap.isOpened():  # se a camera não abrir
     print("Camera não Encontrada")
@@ -21,6 +21,9 @@ buffer_R = []  # Lista do vermelho
 
 bpm_suavizado = 0.0  # valor do bpm ja suavizado
 alpha = 0.05  # usa media exponencial
+
+bpm_para_mostrar = 0.0  # Variável que segura o valor para a tela
+tempo_proxima_atualizacao = time.time() + 8.0 # Agenda a primeira atualização para daqui
 
 print("Coloque seu Dedo na camera do celular")
 print("Pressione 'q' na janela de vídeo para sair.")
@@ -173,15 +176,24 @@ while True:
         else:
 
             bpm_suavizado = 0.0
-
-        if bpm_suavizado > 0:
-            info_bpm = f"O seu BPM estah em: {bpm_suavizado:.1f}"
-            cv2.putText(imagem, info_bpm, (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+    agora = time.time()
+    if agora > tempo_proxima_atualizacao:
+        # Já se passaram 5 segundos? Hora de atualizar o que o usuário vê.
+        
+        if bpm_suavizado > 0: # Se o cálculo for válido
+            bpm_para_mostrar = bpm_suavizado # Atualiza o display
         else:
-            cv2.putText(imagem, "Coloque o dedo", (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
+            bpm_para_mostrar = 0.0 # Reseta o display se o dedo for removido
+        
+        # Agenda a próxima atualização para daqui a 5 segundos
+        tempo_proxima_atualizacao = agora + 5.0
+    if bpm_para_mostrar > 0:
+        info_bpm = f"Batimentos por Minuto: {bpm_para_mostrar:.1f}"
+        cv2.putText(imagem, info_bpm, (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+    else:
+        cv2.putText(imagem, "Coloque o dedo", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2) 
     cv2.putText(imagem, f"FPS: {taxa_fps:.1f}", (
         imagem.shape[1] - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
     cv2.imshow('Analise via Celular:', imagem)
