@@ -101,12 +101,17 @@ while True:
 
         dedo_na_camera = (media_R_recente > media_G_recente + vermelho and media_R_recente > media_B_recente + vermelho)#confere se as duas contas dão TRUE e retorna pra variavel dedo_na_camera, a variavel "vermelho" quando soma com a media_G_recente fala quanto a media_R_recente tem que ser maior pra ser considerada valida 
 
+       #if dedo_na_camera and medir_novamente:
+            # Gnorm = np.array(buffer_G) / (np.mean(buffer_G) + 1e-9)
+            # sinal_ac = Gnorm - np.mean(Gnorm)
+            # sinal_filtrado = bandpass_filter(sinal_ac, low=0.8, high=3, fs=taxa_fps)
+            # peaks, _ = find_peaks(sinal_filtrado, distance=taxa_fps*0.4)
+
         if dedo_na_camera and medir_novamente:
-          
-            Gnorm = np.array(buffer_G) / (np.mean(buffer_G) + 1e-9)
-            sinal_ac = Gnorm - np.mean(Gnorm)# normaliza o buffer_G pra não levar em consideração o tom verde que mais aparece
-            sinal_filtrado = bandpass_filter(sinal_ac, low=0.8, high=3, fs=taxa_fps)#remove as frequencias mais altas e mais baixas da cor verde
-            peaks, _ = find_peaks(sinal_filtrado, distance=taxa_fps*0.4)#aqui encontra os maiores picos ou seja os batimentos
+            Rnorm = np.array(buffer_R) / (np.mean(buffer_R) + 1e-9)
+            sinal_ac = -(Rnorm - np.mean(Rnorm))  # usa canal vermelho e inverte
+            sinal_filtrado = bandpass_filter(sinal_ac, low=0.8, high=3, fs=taxa_fps)
+            peaks, _ = find_peaks(sinal_filtrado, distance=taxa_fps*0.4)
 
             if len(peaks) > 1:
                 intervalos = np.diff(peaks) / taxa_fps# calcula os intervalos entre os picos de  frequencia
@@ -151,3 +156,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
