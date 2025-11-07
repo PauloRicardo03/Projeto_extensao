@@ -1,21 +1,12 @@
 import cv2 
 import numpy as np  
 import time  # Para medir o tempo e calcular FPS
-from scipy.signal import (
-    butter,
-    filtfilt,
-    find_peaks,
-)  # Para filtragem e detecção de picos
+from scipy.signal import butter, filtfilt, find_peaks  # Para filtragem e detecção de picos
 
 # ===================== CONFIGURAÇÕES =====================
 Tamanho_tela = 100  # Quantidade de frames que vamos analisar por vez
-<<<<<<< HEAD
-url = "http://172.20.10.3:8080/video"  # IP da câmera no aplicativo
-cap = cv2.VideoCapture(url)  # Captura o vídeo via IP
-=======
 url = "http://192.168.100.182:4747/video"  # IP da camera no aplicativo
 cap = cv2.VideoCapture(url)  # pega o video da camera
->>>>>>> 159a32ad3603e1ab7467dc85884a71cd6d273631
 
 if not cap.isOpened():  # verifica se abriu a camera mesmo
     print("Camera não Encontrada")
@@ -26,36 +17,16 @@ tempo_espera = time.time()#começa a contar o tempo
 taxa_fps = 30 #só pra exemplificar pq vai mudar esse valor
 
 
-<<<<<<< HEAD
-# Variáveis para fixar BPM
-bpm_fixado = None  # Para armazenar o BPM fixo
-bpm_primeiros = []  # Para armazenar os primeiros 2-3 BPM detectados
-medir_novamente = True  # Controla se deve medir novos batimentos
-=======
 buffer_R, buffer_G, buffer_B = [], [], [] #armazena cada cor em listas
 
 
 bpm_fixado = None       # aramazena o bpm fixo
 bpm_primeiros = []      # armazena os primeiros bpm
 medir_novamente = True  # variavel pra medir os batimentos denovo
->>>>>>> 159a32ad3603e1ab7467dc85884a71cd6d273631
 
 print("Coloque seu Dedo na camera do celular")
 print("Pressione 'q' na janela de vídeo para sair.")
 
-<<<<<<< HEAD
-
-# ===================== FUNÇÃO DE FILTRAGEM =====================
-def bandpass_filter(signal, low=0.8, high=3, fs=30):
-    nyq = 0.5 * fs
-    low /= nyq
-    high /= nyq
-    b, a = butter(2, [low, high], btype="band")
-    return filtfilt(b, a, signal)
-
-
-# ===================== LOOP PRINCIPAL =====================
-=======
 #48(quando a pessoa ta dormindo)/60=0.8
 #180(quando ta fazendo exercicio)/60=3
 def bandpass_filter(signal, low=0.8, high=3, fs=30):
@@ -66,7 +37,6 @@ def bandpass_filter(signal, low=0.8, high=3, fs=30):
     return filtfilt(b, a, signal)# aplica o fltro no signal
 
 
->>>>>>> 159a32ad3603e1ab7467dc85884a71cd6d273631
 while True:
     retorno, imagem = cap.read()  # Captura um frame da câmera
 
@@ -127,14 +97,8 @@ while True:
         media_G_recente = media_BGR[1]
         media_R_recente = media_BGR[2]
 
-        vermelho = 110  # nível mínimo de vermelho
+        vermelho = 60  # nível mínimo de vermelho
 
-<<<<<<< HEAD
-        dedo_na_camera = (
-            media_R_recente > media_G_recente + vermelho
-            and media_R_recente > media_B_recente + vermelho
-        )
-=======
         dedo_na_camera = (media_R_recente > media_G_recente + vermelho and media_R_recente > media_B_recente + vermelho)#confere se as duas contas dão TRUE e retorna pra variavel dedo_na_camera, a variavel "vermelho" quando soma com a media_G_recente fala quanto a media_R_recente tem que ser maior pra ser considerada valida 
 
        #if dedo_na_camera and medir_novamente:
@@ -142,13 +106,12 @@ while True:
             # sinal_ac = Gnorm - np.mean(Gnorm)
             # sinal_filtrado = bandpass_filter(sinal_ac, low=0.8, high=3, fs=taxa_fps)
             # peaks, _ = find_peaks(sinal_filtrado, distance=taxa_fps*0.4)
->>>>>>> 159a32ad3603e1ab7467dc85884a71cd6d273631
 
         if dedo_na_camera and medir_novamente:
             Rnorm = np.array(buffer_R) / (np.mean(buffer_R) + 1e-9)
             sinal_ac = -(Rnorm - np.mean(Rnorm))  # usa canal vermelho e inverte
             sinal_filtrado = bandpass_filter(sinal_ac, low=0.8, high=3, fs=taxa_fps)
-            peaks, _ = find_peaks(sinal_filtrado, distance=taxa_fps * 0.4)
+            peaks, _ = find_peaks(sinal_filtrado, distance=taxa_fps*0.4)
 
             if len(peaks) > 1:
                 intervalos = np.diff(peaks) / taxa_fps# calcula os intervalos entre os picos de  frequencia
@@ -161,67 +124,15 @@ while True:
                     if len(bpm_primeiros) >= 3:#só calcula a media depois de 3bpm
                         bpm_fixado = np.mean(bpm_primeiros)#poe a media em bpm_fixado
 
-<<<<<<< HEAD
-                valor_a_mostrar = bpm_fixado if bpm_fixado is not None else bpm_atual
-                info_bpm = f"O seu BPM esta em: {valor_a_mostrar:.1f}"
-                cv2.putText(
-                    imagem,
-                    info_bpm,
-                    (30, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.5,
-                    (0, 255, 0),
-                    3,
-                )
-=======
                 valor_a_mostrar = bpm_fixado if bpm_fixado is not None else bpm_atual # ve se ja tem bpm_fixado se não tiver ele usa o atual mesmo
                 info_bpm = f"O seu BPM está em: {valor_a_mostrar:.1f}"
                 cv2.putText(imagem, info_bpm, (30, 60), cv2.FONT_HERSHEY_SIMPLEX,
                             1.5, (0, 255, 0), 3)
->>>>>>> 159a32ad3603e1ab7467dc85884a71cd6d273631
             else:
-                info_bpm = (
-                    f"O seu BPM estah em: {bpm_fixado:.1f}"
-                    if bpm_fixado is not None
-                    else "Movimento detectado, aguarde..."
-                )
-                cv2.putText(
-                    imagem,
-                    info_bpm,
-                    (30, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 0, 255),
-                    2,
-                )
+                info_bpm = f"O seu BPM está em: {bpm_fixado:.1f}" if bpm_fixado is not None else "Movimento detectado, aguarde..."
+                cv2.putText(imagem, info_bpm, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
         else:
-<<<<<<< HEAD
-            # ===================== DEDO REMOVIDO =====================
-            cv2.putText(
-                imagem,
-                "Coloque o dedo e pressione 'm' para medir novamente",
-                (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 0, 255),
-                2,
-            )
-
-        # ===================== INFORMAÇÕES DE FPS =====================
-        cv2.putText(
-            imagem,
-            f"FPS: {taxa_fps:.1f}",
-            (imagem.shape[1] - 200, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 0, 0),
-            2,
-        )
-
-    # ===================== EXIBIÇÃO DO VÍDEO =====================
-    cv2.imshow("Analise via Celular:", imagem)
-=======
             
             cv2.putText(imagem, "Coloque o dedo e pressione 'm' para medir novamente", 
                         (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
@@ -232,15 +143,14 @@ while True:
 
     
     cv2.imshow('Analise via Celular:', imagem)
->>>>>>> 159a32ad3603e1ab7467dc85884a71cd6d273631
 
     
     key = cv2.waitKey(1) & 0xFF
-    if key == ord("m"):  # Reiniciar medição
+    if key == ord('m'):  # Reiniciar medição
         bpm_fixado = None
         bpm_primeiros = []
         medir_novamente = True
-    if key == ord("q"):  # Sair
+    if key == ord('q'):  # Sair
         break
 
 
