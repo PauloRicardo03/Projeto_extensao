@@ -145,9 +145,14 @@ while True:
 
                 # Encontra TODOS os picos do FFT
                 # Pega o pico que tem pelo menos 20% da força do pico máximo
+<<<<<<< HEAD
                 peaks, properties = find_peaks(
                     sinal_fft, prominence=np.max(sinal_fft) * 0.2
                 )  # Pega os picos do grafico FFT
+=======
+                peaks, properties = find_peaks(sinal_fft, prominence=np.max(
+                    sinal_fft) * 0.2)  # Pega os picos do grafico FFT
+>>>>>>> 6184d495b4513460ca211e5df0e343281611300c
 
                 if len(peaks) > 0:
                     # Ordena os picos do mais forte para o mais fraco
