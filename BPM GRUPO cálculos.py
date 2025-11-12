@@ -4,12 +4,15 @@
 import streamlit as st                    # Framework para criar a interface web
 import cv2                                # OpenCV para processamento de imagem
 import numpy as np                        # Numpy para cálculos numéricos
-import threading                          # Para rodar cálculos em paralelo (sem travar vídeo)
+# Para rodar cálculos em paralelo (sem travar vídeo)
+import threading
 import time                               # Controle de tempo
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase  # Captura de vídeo via WebRTC
+# Captura de vídeo via WebRTC
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av                                 # Conversão de frames para exibição
 from scipy.signal import butter, filtfilt  # Filtros digitais
-from scipy.fft import rfft, rfftfreq       # FFT (Transformada Rápida de Fourier) para análise de frequência
+# FFT (Transformada Rápida de Fourier) para análise de frequência
+from scipy.fft import rfft, rfftfreq
 
 # ==============================
 # Configuração inicial do Streamlit
@@ -47,12 +50,15 @@ st.toggle("Ligar/Desligar Câmera", key="camera_on")  # Botão de toggle na tela
 # Série de BPM (histórico)
 # ==============================
 if "bpm_series" not in st.session_state:
-    st.session_state.bpm_series = []  # Lista para armazenar valores de BPM ao longo do tempo
+    # Lista para armazenar valores de BPM ao longo do tempo
+    st.session_state.bpm_series = []
 MAX_POINTS = 180  # Quantidade máxima de pontos no gráfico (~3 minutos)
 
 # ==============================
 # Classe de Processamento de Vídeo
 # ==============================
+
+
 class MeuProcessadorDeVideo(VideoProcessorBase):
     def __init__(self):
         # Buffers para armazenar as médias do canal vermelho ao longo do tempo
@@ -67,10 +73,12 @@ class MeuProcessadorDeVideo(VideoProcessorBase):
         self.start_time = time.time()  # Tempo de início da contagem de FPS
         self.alpha_suavizacao = 0.2    # Fator de suavização para BPM
         self.dedo_detectado = False    # Flag indicando se o dedo está cobrindo a câmera
-        self.RED_THRESHOLD = 220       # Limiar mínimo de intensidade vermelha para considerar dedo presente
+        # Limiar mínimo de intensidade vermelha para considerar dedo presente
+        self.RED_THRESHOLD = 220
 
         # Thread separada para calcular BPM continuamente
-        self.calc_thread = threading.Thread(target=self.calcula_bpm_continuo, daemon=True)
+        self.calc_thread = threading.Thread(
+            target=self.calcula_bpm_continuo, daemon=True)
         self.calc_thread.start()
 
     # -----------------------------
@@ -78,7 +86,8 @@ class MeuProcessadorDeVideo(VideoProcessorBase):
     # -----------------------------
     def butter_bandpass(self, lowcut, highcut, fs, order=3):
         nyq = 0.5 * fs                               # Frequência de Nyquist
-        b, a = butter(order, [lowcut / nyq, highcut / nyq], btype="band")  # Cria o filtro
+        b, a = butter(order, [lowcut / nyq, highcut / nyq],
+                      btype="band")  # Cria o filtro
         return b, a
 
     # -----------------------------
@@ -86,7 +95,8 @@ class MeuProcessadorDeVideo(VideoProcessorBase):
     # -----------------------------
     def filtrar_sinal(self, data, lowcut, highcut, fs):
         b, a = self.butter_bandpass(lowcut, highcut, fs)
-        return filtfilt(b, a, data)  # Aplica o filtro para frente e para trás (evita atraso de fase)
+        # Aplica o filtro para frente e para trás (evita atraso de fase)
+        return filtfilt(b, a, data)
 
     # -----------------------------
     # Thread que calcula BPM continuamente
@@ -190,10 +200,12 @@ class MeuProcessadorDeVideo(VideoProcessorBase):
             cor = (0, 0, 255)  # Vermelho
 
         # Mostra BPM, FPS e o ROI na tela
-        cv2.putText(img, texto, (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, cor, 3)
+        cv2.putText(img, texto, (30, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, cor, 3)
         cv2.putText(img, f"FPS: {self.fps:.1f}", (30, 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.rectangle(img, (x_i, y_i), (x_i + roi_size, y_i + roi_size), (0, 255, 0), 2)
+        cv2.rectangle(img, (x_i, y_i), (x_i + roi_size,
+                      y_i + roi_size), (0, 255, 0), 2)
 
         # Retorna o frame processado para exibição
         return av.VideoFrame.from_ndarray(img, format="bgr24")
@@ -204,11 +216,14 @@ class MeuProcessadorDeVideo(VideoProcessorBase):
 # ==============================
 video_constraints = {
     "video": {
-        "facingMode": {"ideal": "environment"},  # Usa a câmera traseira se disponível
+        # Usa a câmera traseira se disponível
+        "facingMode": {"ideal": "environment"},
         "width": {"ideal": 640},                 # Resolução ideal
         "height": {"ideal": 480},
-        "frameRate": {"ideal": 30},              # 30 FPS para melhor precisão de sinal
-        "torch": True,                           # Liga o flash (em celulares que suportam)
+        # 30 FPS para melhor precisão de sinal
+        "frameRate": {"ideal": 30},
+        # Liga o flash (em celulares que suportam)
+        "torch": True,
     },
     "audio": False,  # Desativa o áudio
 }
@@ -219,7 +234,7 @@ ctx = webrtc_streamer(
     video_processor_factory=MeuProcessadorDeVideo,  # Classe que processa os frames
     media_stream_constraints=video_constraints,      # Configurações de câmera
     async_processing=True,                           # Processamento assíncrono
-    desired_playing_state=st.session_state.camera_on, # Estado ligado/desligado
+    desired_playing_state=st.session_state.camera_on,  # Estado ligado/desligado
 )
 
 # ==============================
@@ -230,7 +245,8 @@ chart_placeholder = st.empty()  # Espaço reservado para o gráfico
 
 # Atualiza  os  BPM se houver novos dados
 if ctx and ctx.state.playing and ctx.video_processor:
-    bpm_val = float(ctx.video_processor.bpm) if ctx.video_processor.bpm else 0.0
+    bpm_val = float(
+        ctx.video_processor.bpm) if ctx.video_processor.bpm else 0.0
     if bpm_val > 0:
         st.session_state.bpm_series.append(bpm_val)
         if len(st.session_state.bpm_series) > MAX_POINTS:
@@ -240,7 +256,8 @@ if ctx and ctx.state.playing and ctx.video_processor:
 if len(st.session_state.bpm_series) >= 2:
     chart_placeholder.line_chart(st.session_state.bpm_series)
 else:
-    chart_placeholder.info("Aguardando cálculos de BPM… posicione o dedo e aguarde alguns segundos.")
+    chart_placeholder.info(
+        "Aguardando cálculos de BPM… posicione o dedo e aguarde alguns segundos.")
 
 # ==============================
 # Atualização periódica da interface
