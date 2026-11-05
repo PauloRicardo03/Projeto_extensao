@@ -1,38 +1,122 @@
 # ==============================
 # Importação das bibliotecas
 # ==============================
-import streamlit as st # Biblioteca para criar o aplicativo web e a interface.
-import cv2 # OpenCV, para processamento de imagem e vídeo (ex: desenhar retângulo).
-import numpy as np # NumPy, para cálculos numéricos e manipulação de arrays.
-import threading # Para executar o cálculo de BPM em paralelo (thread) sem travar a interface.
-import time # Para calcular o tempo (FPS) e adicionar pausas (sleep).
-# Importa componentes para ligar a câmera (WebRTC) do navegador ao Python:
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase 
-# webrtc_streamer: Cria o componente de vídeo na tela.
-# VideoProcessorBase: Classe base que usamos para processar os frames de vídeo.
-import av # Biblioteca que "traduz" os frames de vídeo entre o WebRTC e o NumPy/CV2.
-# Importa funções de processamento de sinal do SciPy:
-from scipy.signal import butter, filtfilt, find_peaks
-# butter: Cria os coeficientes de um filtro digital (passa-banda).
-# filtfilt: Aplica o filtro ao sinal (remove ruído) sem atraso de fase.
-# find_peaks: Usado no modo vídeo para achar os picos (batidas).
-# Importa funções de Transformada de Fourier (FFT) do SciPy:
-from scipy.fft import rfft, rfftfreq
-# rfft: Calcula a FFT de um sinal real (transforma o sinal do domínio do TEMPO para o domínio da FREQUÊNCIA).
-# rfftfreq: Gera o "eixo X" (as frequências em Hz) correspondentes ao resultado do rfft.
-import matplotlib.pyplot as plt # (Não está sendo usado neste código, mas serve para plotar gráficos).
-import tempfile # Usado para criar um arquivo temporário para salvar o vídeo do upload.
-import os # Usado para apagar o arquivo de vídeo temporário após a análise.
+from collections import deque  # Estrutura de fila circular rápida para a mediana móvel de estabilização.
+import os                      # Usado para apagar o arquivo de vídeo temporário após a análise.
+import tempfile                # Usado para criar um arquivo temporário para salvar o vídeo do upload.
+import threading               # Para executar os cálculos de DSP em paralelo (thread) sem travar o vídeo.
+import time                    # Para registrar timestamps reais de cada frame e controlar intervalos.
+
+import av                      # Biblioteca que "traduz" os frames de vídeo entre o WebRTC e o NumPy/OpenCV.
+import cv2                     # OpenCV, para processamento de imagem, recorte de ROI e detecção facial.
+import numpy as np             # NumPy, para cálculos numéricos, interpolação e manipulação matricial.
+import pandas as pd            # Pandas, usado para alimentar incrementalmente o gráfico sem piscar (add_rows).
+import streamlit as st         # Biblioteca para criar o aplicativo web e a interface interativa.
+import streamlit.components.v1 as components  # Usado para injetar o manifesto e Service Worker do PWA no navegador.
+from scipy.fft import rfft, rfftfreq  # rfft/rfftfreq: Transformada Rápida de Fourier para sinais reais.
+from scipy.signal import butter, detrend, filtfilt, find_peaks  # Filtros digitais, remoção de tendência e picos.
+from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
+
+# Configuração de servidor STUN público do Google:
+# Essencial para que o vídeo WebRTC funcione quando acessado pelo celular via túnel (Cloudflare/ngrok) ou redes diferentes.
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 
 # ==============================
-# Configuração inicial do Streamlit
+# Configuração inicial do Streamlit e PWA
 # ==============================
-# Configura a página do Streamlit (título da aba, layout).
-st.set_page_config(page_title="PPG Real-Time + Flash", layout="centered")
-st.title("💡 Monitor Cardíaco em Tempo Real") # Título principal na página.
+st.set_page_config(page_title="PPG & rPPG Monitor Multiparamétrico", layout="centered")
 
-# Injeta CSS personalizado para estilizar a página.
+
+def garantir_icones_pwa():
+    """Gera automaticamente os ícones 192x192 e 512x512 na pasta static/ caso não existam."""
+    raiz_projeto = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    pasta_static = os.path.join(raiz_projeto, "static")
+    os.makedirs(pasta_static, exist_ok=True)
+
+    for tamanho in (192, 512):
+        caminho_icone = os.path.join(pasta_static, f"icon-{tamanho}.png")
+        if not os.path.exists(caminho_icone):
+            img = np.zeros((tamanho, tamanho, 3), dtype=np.uint8)
+            img[:] = (23, 17, 14)  # Fundo escuro (#0E1117 em BGR)
+            centro = tamanho // 2
+            raio = int(tamanho * 0.38)
+            cv2.circle(img, (centro, centro), raio, (75, 75, 255), -1, lineType=cv2.LINE_AA)
+            # Desenha linha de pulso (ECG) branca no centro do ícone
+            pts = np.array(
+                [
+                    [int(tamanho * 0.22), centro],
+                    [int(tamanho * 0.38), centro],
+                    [int(tamanho * 0.44), int(tamanho * 0.30)],
+                    [int(tamanho * 0.52), int(tamanho * 0.72)],
+                    [int(tamanho * 0.60), int(tamanho * 0.42)],
+                    [int(tamanho * 0.65), centro],
+                    [int(tamanho * 0.78), centro],
+                ],
+                dtype=np.int32,
+            )
+            espessura = max(4, tamanho // 32)
+            cv2.polylines(img, [pts], isClosed=False, color=(255, 255, 255), thickness=espessura, lineType=cv2.LINE_AA)
+            cv2.imwrite(caminho_icone, img)
+
+
+garantir_icones_pwa()
+
+# Injeção do Manifesto PWA, Meta Tags Mobile (Android/iOS) e Service Worker no documento principal
+components.html(
+    """
+    <script>
+      (function() {
+        const doc = window.parent ? window.parent.document : document;
+        const nav = window.parent ? window.parent.navigator : navigator;
+
+        if (!doc.querySelector('link[rel="manifest"]')) {
+          const manifestLink = doc.createElement('link');
+          manifestLink.rel = 'manifest';
+          manifestLink.href = '/app/static/manifest.json';
+          doc.head.appendChild(manifestLink);
+        }
+
+        if (!doc.querySelector('meta[name="theme-color"]')) {
+          const themeMeta = doc.createElement('meta');
+          themeMeta.name = 'theme-color';
+          themeMeta.content = '#FF4B4B';
+          doc.head.appendChild(themeMeta);
+        }
+
+        if (!doc.querySelector('meta[name="apple-mobile-web-app-capable"]')) {
+          const appleCapable = doc.createElement('meta');
+          appleCapable.name = 'apple-mobile-web-app-capable';
+          appleCapable.content = 'yes';
+          doc.head.appendChild(appleCapable);
+
+          const appleIcon = doc.createElement('link');
+          appleIcon.rel = 'apple-touch-icon';
+          appleIcon.href = '/app/static/icon-192.png';
+          doc.head.appendChild(appleIcon);
+        }
+
+        if ('serviceWorker' in nav) {
+          nav.serviceWorker.register('/app/static/sw.js')
+            .then(function(reg) {
+              console.log('PWA Service Worker registrado:', reg.scope);
+            })
+            .catch(function(err) {
+              console.warn('Falha ao registrar Service Worker:', err);
+            });
+        }
+      })();
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
+st.title("💡 Monitor Multiparamétrico em Tempo Real (PPG & rPPG)")
+
+# Injeta CSS personalizado para estilizar a página e impedir o efeito de "piscar" nas atualizações.
 st.markdown(
     """
     <style>
@@ -40,434 +124,768 @@ st.markdown(
     div[data-testid="stWebRTCStatus"] { 
         display: none !important;
     }
+    /* Impede que os componentes fiquem opacos ("piscando") durante atualizações em tempo real */
+    div[data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
     /* Estilização do player de vídeo */
     video {
-        transform: rotate(90deg); /* Gira o vídeo (para celular em pé) */
-        object-fit: cover; /* Garante que o vídeo preencha o espaço */
+        object-fit: cover;
         width: 100%;
-        height: 80vh; /* Altura de 80% da tela */
-        border-radius: 10px; /* Bordas arredondadas */
+        height: 65vh;
+        border-radius: 10px;
     }
     </style>
     """,
-    unsafe_allow_html=True, # Permite que o Streamlit injete o CSS.
+    unsafe_allow_html=True,
 )
 
 
 # ==============================
-# Seleção da fonte (Câmera ou Vídeo)
+# Seleção da Fonte do Sinal
 # ==============================
-# Cria botões de rádio para o usuário escolher o modo de operação.
-fonte = st.radio("Fonte do sinal", ("Câmera (WebRTC)",
-                                  "Vídeo (upload)"), horizontal=True)
-
-
-# ==============================
-# Série de BPM (histórico)
-# ==============================
-# O st.session_state é a "memória" do app que persiste entre os recarregamentos.
-# Verifica se a lista 'bpm_series' (histórico do gráfico) já existe na memória.
-if "bpm_series" not in st.session_state:
-    st.session_state.bpm_series = [] # Se não existir, cria como uma lista vazia.
-MAX_POINTS = 180  # Define o tamanho máximo do histórico do gráfico (aprox. 3 min se 1 ponto/seg).
+# Três modos de operação: Contato (Dedo), Remoto (Rosto/rPPG) e Offline (Upload de Vídeo).
+fonte = st.radio(
+    "Fonte do sinal",
+    (
+        "Dedo (Traseira + Flash)",
+        "Rosto (Frontal - rPPG)",
+        "Vídeo (Upload)",
+    ),
+    horizontal=True,
+)
 
 
 # ==============================
-# Funções utilitárias
+# Estabilizador Fisiológico e Funções de DSP
 # ==============================
-# Define a função do filtro passa-banda (deixa passar só frequências entre lowcut e highcut).
-def bandpass_filter(data, lowcut, highcut, fs):
-    # data: O sinal bruto (array numpy).
-    # lowcut: Frequência de corte inferior (ex: 0.7 Hz).
-    # highcut: Frequência de corte superior (ex: 3.0 Hz).
-    # fs: Taxa de amostragem (Frames Por Segundo).
+class EstabilizadorFisiologico:
+    """
+    Garante uma leitura segura e clinicamente plausível combinando:
+    1. Filtro de Mediana Móvel (descarta picos isolados/outliers).
+    2. Slew-Rate Limiter (limita a variação máxima por ciclo à fisiologia humana).
+    3. Suavização Exponencial (EMA).
+    """
 
-    # Trava de segurança (Teorema de Nyquist): fs deve ser pelo menos 2x o highcut.
-    if fs <= 2 * highcut:
-        fs = 2 * highcut + 1.0  # Força um fs seguro se o FPS estiver muito baixo.
+    def __init__(self, janela_mediana: int = 7, alpha: float = 0.15, max_delta_por_ciclo: float = 1.2):
+        self.historico = deque(maxlen=janela_mediana)
+        self.valor_estavel = 0.0
+        self.alpha = alpha
+        self.max_delta = max_delta_por_ciclo
 
-    nyq = 0.5 * fs # Calcula a frequência de Nyquist (metade do fs).
-    low = lowcut / nyq # Normaliza a frequência de corte inferior (valor entre 0 e 1).
-    high = highcut / nyq # Normaliza a frequência de corte superior.
+    def reset(self):
+        """Limpa o histórico quando o dedo ou rosto sai do enquadramento."""
+        self.historico.clear()
+        self.valor_estavel = 0.0
 
-    # Garante que os cortes estão estritamente entre 0 e 1 (requisito do 'butter').
-    low = max(0.01, min(0.99, low))
-    high = max(0.01, min(0.99, high))
+    def atualizar(self, novo_valor: float) -> float:
+        """Recebe uma nova estimativa bruta e retorna o valor estabilizado."""
+        if novo_valor <= 0.0:
+            return self.valor_estavel
 
-    # Desenha o filtro digital, obtendo os coeficientes (b, a).
-    b, a = butter(2, [low, high], btype="band")
-    # Aplica o filtro (b, a) aos dados (data) e retorna o sinal limpo.
-    return filtfilt(b, a, data)
+        # Se já temos leituras anteriores, amortece desvios abruptos (> 25% da mediana atual)
+        if len(self.historico) >= 3:
+            mediana_atual = float(np.median(self.historico))
+            if abs(novo_valor - mediana_atual) > 0.25 * mediana_atual:
+                novo_valor = mediana_atual + np.sign(novo_valor - mediana_atual) * (0.10 * mediana_atual)
+
+        self.historico.append(novo_valor)
+
+        # Aguarda pelo menos 3 estimativas consistentes antes de exibir o primeiro valor
+        if len(self.historico) < 3:
+            return 0.0
+
+        alvo = float(np.median(self.historico))
+
+        if self.valor_estavel == 0.0:
+            self.valor_estavel = alvo
+        else:
+            # Slew-Rate Limiter: impede que o número salte mais que 'max_delta' em um único ciclo
+            delta = alvo - self.valor_estavel
+            delta_limitado = float(np.clip(delta, -self.max_delta, self.max_delta))
+            proposto = self.valor_estavel + delta_limitado
+            # Média Móvel Exponencial (EMA)
+            self.valor_estavel = self.alpha * proposto + (1.0 - self.alpha) * self.valor_estavel
+
+        return self.valor_estavel
 
 
-# ==============================
-# MODO CÂMERA (WebRTC)
-# ==============================
-# Verifica qual botão de rádio o usuário selecionou.
-if fonte == "Câmera (WebRTC)":
+def reamostrar_uniforme(timestamps: np.ndarray, valores: np.ndarray, fs_alvo: float = 30.0) -> np.ndarray:
+    """
+    No WebRTC, os frames podem chegar com pequenas variações de tempo (jitter de rede).
+    Esta função interpola os dados reais para uma grade de tempo perfeitamente uniforme (30 Hz),
+    garantindo que o filtro Butterworth e a FFT operem sem distorção espectral.
+    """
+    if len(timestamps) < 10:
+        return valores
+    duracao = timestamps[-1] - timestamps[0]
+    if duracao <= 1.0:
+        return valores
 
-    # --- Controle do Botão Toggle ---
-    TOGGLE_KEY = "camera_on_v5" # Chave única para o botão na memória (session_state).
-    # Verifica se o estado do botão (ligado/desligado) já existe na memória.
+    num_pontos = int(duracao * fs_alvo)
+    if num_pontos < 16:
+        return valores
+
+    grade_tempo = np.linspace(timestamps[0], timestamps[-1], num_pontos)
+    return np.interp(grade_tempo, timestamps, valores)
+
+
+def bandpass_filter(
+    data: np.ndarray, lowcut: float, highcut: float, fs: float, order: int = 3
+) -> np.ndarray:
+    """
+    Remove a tendência linear (detrend) e aplica um filtro passa-faixa Butterworth bidirecional (filtfilt),
+    que preserva a fase do sinal fisiológico.
+    """
+    if fs <= 2.0 * highcut:
+        fs = 2.0 * highcut + 1.0
+
+    nyq = 0.5 * fs
+    low = max(0.001, min(0.99, lowcut / nyq))
+    high = max(0.001, min(0.99, highcut / nyq))
+
+    if low >= high:
+        low = high * 0.5
+
+    b, a = butter(order, [low, high], btype="band")
+    sinal_sem_tendencia = detrend(data)
+    return filtfilt(b, a, sinal_sem_tendencia)
+
+
+def estimar_frequencia_segura(
+    signal_filtrado: np.ndarray,
+    fs: float,
+    f_min: float,
+    f_max: float,
+    snr_minimo: float = 1.6,
+    usar_picos_tempo: bool = True,
+) -> float:
+    """
+    Calcula a frequência dominante em Hz com validação de segurança:
+    1. Aplica janela de Hann + Zero-Padding (n_fft=2048) para resolução fina (< 0.9 BPM).
+    2. Avalia a Relação Sinal-Ruído (SNR): se não houver um pico claro (movimento), retorna 0.0.
+    3. Combina a leitura da FFT com a mediana dos intervalos entre picos no tempo (find_peaks).
+    """
+    n = len(signal_filtrado)
+    if n < 30:
+        return 0.0
+
+    # Janela de Hann reduz vazamento espectral nas bordas do buffer
+    janela = np.hanning(n)
+    sinal_janelado = signal_filtrado * janela
+
+    # Zero-Padding para 2048 pontos evita que a FFT dê saltos em degraus grandes
+    fft_size = max(n, 2048)
+    freqs = rfftfreq(fft_size, d=1.0 / fs)
+    fft_mag = np.abs(rfft(sinal_janelado, n=fft_size))
+
+    valid = (freqs >= f_min) & (freqs <= f_max)
+    if not np.any(valid):
+        return 0.0
+
+    mag_valid = fft_mag[valid]
+    freqs_valid = freqs[valid]
+
+    idx_max = int(np.argmax(mag_valid))
+    pico_mag = mag_valid[idx_max]
+    mediana_mag = float(np.median(mag_valid)) + 1e-9
+
+    # Validação de Qualidade do Sinal (SQI / SNR)
+    snr = pico_mag / mediana_mag
+    if snr < snr_minimo:
+        return 0.0
+
+    freq_fft = float(freqs_valid[idx_max])
+
+    if not usar_picos_tempo:
+        return freq_fft
+
+    # Consenso com o domínio do tempo (distância entre batimentos sistólicos)
+    dist_min = max(1, int(fs / f_max * 0.75))
+    peaks, _ = find_peaks(signal_filtrado, distance=dist_min, prominence=np.std(signal_filtrado) * 0.35)
+    if len(peaks) >= 3:
+        ibis = np.diff(peaks) / fs
+        ibis_validos = ibis[(ibis >= 1.0 / f_max) & (ibis <= 1.0 / f_min)]
+        if len(ibis_validos) >= 2:
+            # Coeficiente de variação (CV): verifica se os batimentos estão regulares
+            cv_ibi = np.std(ibis_validos) / (np.mean(ibis_validos) + 1e-9)
+            if cv_ibi < 0.25:
+                freq_tempo = 1.0 / float(np.median(ibis_validos))
+                return 0.65 * freq_fft + 0.35 * freq_tempo
+
+    return freq_fft
+
+
+def calcular_spo2_empirico(buf_r: np.ndarray, buf_b: np.ndarray) -> float:
+    """
+    Calcula a saturação de oxigênio (SpO2 %) usando a Razão de Razões (Ros):
+    - Componente DC: média estática de absorção luminosa (np.mean).
+    - Componente AC: oscilação pulsátil sem tendência (np.std).
+    - Fórmula empírica calibrada: SpO2 = 110.0 - 25.0 * Ros (limitado entre 70% e 100%).
+    """
+    dc_r = np.mean(buf_r)
+    ac_r = np.std(detrend(buf_r))
+    dc_b = np.mean(buf_b)
+    ac_b = np.std(detrend(buf_b))
+
+    if dc_r <= 1e-6 or dc_b <= 1e-6 or ac_b <= 1e-6:
+        return 0.0
+
+    r_os = (ac_r / (dc_r + 1e-9)) / (ac_b / (dc_b + 1e-9))
+    r_os = float(np.clip(r_os, 0.4, 1.2))
+    spo2 = 110.0 - (25.0 * r_os)
+    return float(np.clip(spo2, 70.0, 100.0))
+
+
+# ==============================================================================
+# 1. MODO DEDO / TRASEIRA (PPG de Contato: BPM + SpO2)
+# ==============================================================================
+if fonte == "Dedo (Traseira + Flash)":
+
+    TOGGLE_KEY = "camera_dedo_on"
     if TOGGLE_KEY not in st.session_state:
-        st.session_state[TOGGLE_KEY] = False # Se não, define como desligado por padrão.
-    # Cria o botão toggle, 'camera_on' guardará True (ligado) ou False (desligado).
-    camera_on = st.toggle("📷 Ligar/Desligar Câmera", key=TOGGLE_KEY)
+        st.session_state[TOGGLE_KEY] = False
+    camera_on = st.toggle("📷 Ligar/Desligar Câmera Traseira", key=TOGGLE_KEY)
 
-    st.divider() # Desenha uma linha horizontal na interface.
+    st.divider()
 
-    # --- Área de Informações (Placeholders) ---
-    # Cria colunas na interface (2/3 para status, 1/3 para BPM).
-    col_status, col_bpm = st.columns([2, 1])
-
+    # Colunas para exibir o status e os cards de métricas (BPM e SpO2)
+    col_status, col_bpm, col_spo2 = st.columns([2, 1, 1])
     with col_status:
-        # 'st.empty()' cria um placeholder (espaço vazio) para atualizar o status.
         status_display = st.empty()
-
     with col_bpm:
-        # Placeholder para atualizar o valor do BPM.
         bpm_display = st.empty()
+    with col_spo2:
+        spo2_display = st.empty()
 
-    # ----------------------------------------------
-
-    # --- Processador de Vídeo ---
-    # Define nossa classe de processamento, herdando de VideoProcessorBase.
-    class MeuProcessadorDeVideo(VideoProcessorBase):
-        # O 'init' (construtor) é chamado uma vez quando o processador é criado.
+    class ProcessadorDedoPPG(VideoProcessorBase):
         def __init__(self):
-            # 'buffer_R': Lista que armazena os valores médios do canal vermelho (sinal bruto).
+            # Buffers sincronizados para os canais Vermelho (R), Azul (B) e timestamps
             self.buffer_R = []
-            # 'buffer_size': Quantidade de amostras (frames) que o buffer deve guardar (150).
-            self.buffer_size = 150
-            # 'lock': Um "cadeado" para evitar que a thread de cálculo e a thread de vídeo
-            # mexam no 'buffer_R' ao mesmo tempo (evita "race condition").
+            self.buffer_B = []
+            self.timestamps = []
+            self.buffer_size = 180   # ~6s de janela a 30 FPS
+            self.min_samples = 75    # ~2.5s mínimos para iniciar o cálculo
             self.lock = threading.Lock()
-            # 'bpm': Armazena o valor de BPM calculado (inicialmente 0).
+
             self.bpm = 0.0
-            # 'fps': Armazena os frames por segundo calculados.
-            self.fps = 0.0
-            # 'frame_count': Contador de frames para o cálculo de FPS.
+            self.spo2 = 0.0
+            self.estabilizador_bpm = EstabilizadorFisiologico(
+                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=1.2
+            )
+            self.estabilizador_spo2 = EstabilizadorFisiologico(
+                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=0.4
+            )
+
+            self.fps = 30.0
             self.frame_count = 0
-            # 'start_time': Tempo inicial para o cálculo de FPS.
             self.start_time = time.time()
-            # 'dedo_detectado': Flag (True/False) que indica se o dedo está na câmera.
+
             self.dedo_detectado = False
-            # 'RED_THRESHOLD': O nível mínimo de "vermelho" para considerar o dedo detectado.
-            self.RED_THRESHOLD = 220
-            # 'calc_thread': Define a thread de cálculo.
-            # 'target': Função que a thread deve executar (o loop 'calcula_bpm_continuo').
-            # 'daemon=True': Faz a thread fechar automaticamente quando o programa principal parar.
-            self.calc_thread = threading.Thread(
-                target=self.calcula_bpm_continuo, daemon=True)
-            # Inicia a thread de cálculo em segundo plano.
+            self.RED_THRESHOLD = 175.0
+
+            self.running = True
+            self.calc_thread = threading.Thread(target=self._loop_calculo, daemon=True)
             self.calc_thread.start()
 
-        # Esta função roda em loop infinito na thread de cálculo (em paralelo).
-        def calcula_bpm_continuo(self):
-            while True: # Loop infinito.
-                time.sleep(4.0)  # Pausa por 4 segundos antes de recalcular o BPM.
-
-                # 'with self.lock:' Adquire o "cadeado". Garante que 'recv' não mude o buffer.
+        def _loop_calculo(self):
+            """Thread de processamento de sinais em segundo plano (roda a cada 0.5s)."""
+            fs_uniforme = 30.0
+            while self.running:
+                time.sleep(0.5)
                 with self.lock:
-                    # Se o dedo não estiver detectado ou o buffer não estiver cheio (150 amostras),
-                    if not self.dedo_detectado or len(self.buffer_R) < self.buffer_size:
-                        continue # ...pula este ciclo e volta a dormir por 4s.
+                    if not self.dedo_detectado or len(self.buffer_R) < self.min_samples:
+                        continue
+                    arr_r = np.array(self.buffer_R, dtype=np.float64)
+                    arr_b = np.array(self.buffer_B, dtype=np.float64)
+                    arr_t = np.array(self.timestamps, dtype=np.float64)
 
-                    # --- Trava de Segurança (Nyquist) ---
-                    fs_real = self.fps # Pega o FPS real medido.
-                    # Se o FPS real for muito baixo (< 7), usa 30.0 (padrão) no cálculo.
-                    # Isso evita o crash 'ValueError' do filtro 'butter'.
-                    fs = fs_real if fs_real > 7.0 else 30.0
+                try:
+                    # 1. Reamostragem uniforme em 30 Hz
+                    r_uniforme = reamostrar_uniforme(arr_t, arr_r, fs_alvo=fs_uniforme)
 
-                    # Bloco 'try' para capturar erros matemáticos (ex: 'ValueError') sem travar.
-                    try:
-                        # Converte a lista 'buffer_R' para um array numpy.
-                        data = np.array(self.buffer_R)
-                        # Normalização (Z-score): (valor - média) / desvio_padrão.
-                        # Isso centraliza o sinal em 0 e remove variações lentas de brilho.
-                        data = (data - np.mean(data)) / (np.std(data) + 1e-9)
+                    # Se houver variação abrupta de brilho (dedo escorregando), ignora a janela
+                    if np.std(detrend(r_uniforme)) > 25.0:
+                        continue
 
-                        # Aplica o filtro passa-banda (deixa passar só 0.7Hz a 3.0Hz).
-                        filtered = bandpass_filter(data, 0.7, 3.0, fs)
+                    norm_r = (r_uniforme - np.mean(r_uniforme)) / (np.std(r_uniforme) + 1e-9)
 
-                        # --- Cálculo da FFT ---
-                        # Gera o "eixo X" (frequências em Hz) para o resultado da FFT.
-                        freqs = rfftfreq(len(filtered), d=1.0 / fs)
-                        # Calcula a FFT (transforma o sinal em frequências) e pega a magnitude.
-                        fft_vals = np.abs(rfft(filtered))
+                    # Filtra na banda cardíaca segura: 0.85 Hz (51 BPM) a 2.5 Hz (150 BPM)
+                    filt_r = bandpass_filter(norm_r, 0.85, 2.5, fs_uniforme, order=3)
+                    peak_hz = estimar_frequencia_segura(
+                        filt_r, fs_uniforme, 0.85, 2.5, snr_minimo=1.6, usar_picos_tempo=True
+                    )
+                    bpm_bruto = peak_hz * 60.0
 
-                        # --- Encontrar o Pico ---
-                        # Cria uma máscara booleana, selecionando só a faixa de interesse (0.7-3.0Hz).
-                        valid = (freqs >= 0.7) & (freqs <= 3.0)
-                        # Verifica se existe algum valor na faixa de interesse.
-                        if np.any(valid):
-                            # Encontra a frequência (Hz) que tem a maior magnitude (pico)
-                            # *apenas* dentro da faixa 'valid'.
-                            peak_freq = freqs[valid][np.argmax(
-                                fft_vals[valid])]
-                            # Converte a frequência de pico (Hz = batidas/seg) para BPM (batidas/min).
-                            bpm = peak_freq * 60.0
-                            # Validação: só aceita BPMs entre 40 e 180.
-                            if 40 < bpm < 180:
-                                # Suavização Exponencial (EMA):
-                                # O novo BPM é 20% do valor recém-calculado + 80% do valor antigo.
-                                # Isso estabiliza o número e evita que ele "pule" muito.
-                                self.bpm = bpm if self.bpm == 0 else bpm*0.2 + self.bpm*0.8
-                    except Exception as e: # Se der qualquer erro matemático...
-                        # Imprime o erro no console (terminal) mas não para o programa.
-                        print(f"Erro no cálculo BPM: {e}")
-                        continue # Pula este ciclo de cálculo.
+                    # 2. Cálculo de SpO2 (%) pelos canais R e B
+                    spo2_bruto = calcular_spo2_empirico(arr_r, arr_b)
 
-        # Esta função ('recv') é chamada para CADA frame que chega da câmera.
-        def recv(self, frame):
-            # Converte o frame do formato 'av' (WebRTC) para 'numpy' (OpenCV).
+                    with self.lock:
+                        if 50.0 <= bpm_bruto <= 150.0:
+                            self.bpm = self.estabilizador_bpm.atualizar(bpm_bruto)
+                        if 70.0 <= spo2_bruto <= 100.0:
+                            self.spo2 = self.estabilizador_spo2.atualizar(spo2_bruto)
+                except Exception as e:
+                    print(f"[Erro DSP Dedo]: {e}")
+                    continue
+
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            """Executado para cada frame recebido da câmera sem bloquear o vídeo."""
             img = frame.to_ndarray(format="bgr24")
-            # Pega as dimensões da imagem (Altura, Largura, Canais).
             h, w, _ = img.shape
-            # Define o tamanho da Região de Interesse (ROI) como 50% da menor dimensão.
+
+            # ROI Central (50% da menor dimensão)
             roi_size = int(min(h, w) * 0.5)
-            # Calcula a coordenada X inicial para centralizar o ROI.
             x_i = (w - roi_size) // 2
-            # Calcula a coordenada Y inicial para centralizar o ROI.
             y_i = (h - roi_size) // 2
-            # Recorta o quadrado (ROI) do centro da imagem original.
-            roi = img[y_i:y_i + roi_size, x_i:x_i + roi_size]
+            roi = img[y_i : y_i + roi_size, x_i : x_i + roi_size]
 
-            # --- Cálculo de FPS (Frames Por Segundo) ---
-            self.frame_count += 1 # Incrementa o contador de frames.
-            now = time.time() # Pega o tempo atual.
-            # Verifica se já se passou 1 segundo.
-            if now - self.start_time >= 1.0:
-                # Calcula o FPS (frames / segundos).
-                self.fps = self.frame_count / (now - self.start_time)
-                self.frame_count = 0 # Zera o contador de frames.
-                self.start_time = now # Reseta o tempo inicial.
+            now = time.time()
+            self.frame_count += 1
+            elapsed = now - self.start_time
+            if elapsed >= 1.0:
+                self.fps = self.frame_count / elapsed
+                self.frame_count = 0
+                self.start_time = now
 
-            # --- Processamento do Sinal (Sinal Bruto) ---
-            # Calcula a média de todos os pixels do canal VERMELHO (índice 2 no BGR) no ROI.
-            mean_red_value = np.mean(roi[:, :, 2]) if roi.size > 0 else 0
-            # Verifica se a média de vermelho é alta o suficiente para ser um dedo.
-            self.dedo_detectado = mean_red_value > self.RED_THRESHOLD
+            if roi.size > 0:
+                # Extrai simultaneamente a média dos canais Azul (0) e Vermelho (2)
+                mean_bgr = np.mean(roi, axis=(0, 1))
+                mean_b = float(mean_bgr[0])
+                mean_r = float(mean_bgr[2])
+            else:
+                mean_b, mean_r = 0.0, 0.0
 
-            # 'with self.lock:' Adquire o "cadeado". Garante que 'calcula_bpm' não leia o buffer.
+            dedo_ok = mean_r > self.RED_THRESHOLD
+
             with self.lock:
-                if self.dedo_detectado: # Se o dedo está na câmera...
-                    # Adiciona a média de vermelho atual ao final do buffer.
-                    self.buffer_R.append(mean_red_value)
-                    # Se o buffer ultrapassar o tamanho máximo (150)...
+                self.dedo_detectado = dedo_ok
+                if dedo_ok:
+                    self.buffer_R.append(mean_r)
+                    self.buffer_B.append(mean_b)
+                    self.timestamps.append(now)
                     if len(self.buffer_R) > self.buffer_size:
-                        self.buffer_R.pop(0) # Remove o valor mais antigo (do começo da lista).
-                else: # Se o dedo foi removido...
-                    self.buffer_R.clear() # Limpa o buffer (evita dados sujos).
-                    self.bpm = 0.0 # Zera o BPM.
+                        self.buffer_R.pop(0)
+                        self.buffer_B.pop(0)
+                        self.timestamps.pop(0)
+                else:
+                    self.buffer_R.clear()
+                    self.buffer_B.clear()
+                    self.timestamps.clear()
+                    self.estabilizador_bpm.reset()
+                    self.estabilizador_spo2.reset()
+                    self.bpm = 0.0
+                    self.spo2 = 0.0
 
-            # --- Feedback Visual (Desenho no Frame) ---
-            if not self.dedo_detectado: # Se não há dedo...
-                cor_retangulo = (0, 0, 255)  # Vermelho (BGR).
-            elif self.bpm <= 0: # Se há dedo, mas ainda calculando...
-                cor_retangulo = (0, 255, 255)  # Amarelo (BGR).
-            else: # Se há dedo e BPM foi calculado...
-                cor_retangulo = (0, 255, 0)  # Verde (BGR).
+                bpm_atual = self.bpm
 
-            # Desenha o retângulo (na imagem 'img') com a cor definida.
-            cv2.rectangle(img, (x_i, y_i), (x_i + roi_size,
-                                          y_i + roi_size), cor_retangulo, 3)
-            # Converte o frame modificado ('img') de volta para o formato 'av' e o retorna.
+            # Cor do retângulo de feedback: Vermelho (sem dedo), Amarelo (calibrando), Verde (estável)
+            if not dedo_ok:
+                cor_retangulo = (0, 0, 255)
+            elif bpm_atual <= 0:
+                cor_retangulo = (0, 255, 255)
+            else:
+                cor_retangulo = (0, 255, 0)
+
+            cv2.rectangle(img, (x_i, y_i), (x_i + roi_size, y_i + roi_size), cor_retangulo, 3)
             return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    # --- Configurações da Câmera (WebRTC) ---
-    video_constraints = {
+    video_constraints_dedo = {
         "video": {
-            # Pede para o navegador usar a câmera traseira ("environment").
             "facingMode": {"ideal": "environment"},
-            "width": {"ideal": 640}, # Sugere largura.
-            "height": {"ideal": 480}, # Sugere altura.
-            "frameRate": {"ideal": 30}, # Sugere 30 FPS.
-            "torch": True, # Pede para ligar o flash (lanterna).
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 30},
+            "advanced": [{"torch": True}],
         },
-        "audio": False, # Não precisamos de áudio.
+        "audio": False,
     }
 
-    # --- Inicialização do Componente WebRTC ---
-    # 'ctx' (contexto) armazena o estado do componente de vídeo.
     ctx = webrtc_streamer(
-        key="camera_flash", # ID único do componente.
-        # Fábrica: Diz ao webrtc para criar um objeto da nossa classe 'MeuProcessadorDeVideo'.
-        video_processor_factory=MeuProcessadorDeVideo,
-        # Aplica as restrições de vídeo (câmera traseira, flash).
-        media_stream_constraints=video_constraints,
-        # 'True' faz o 'recv' rodar em sua própria thread, não travando a UI.
+        key="camera_dedo_ppg",
+        video_processor_factory=ProcessadorDedoPPG,
+        media_stream_constraints=video_constraints_dedo,
+        rtc_configuration=RTC_CONFIGURATION,
         async_processing=True,
-        # Conecta o estado do componente (ligado/desligado) ao nosso botão toggle.
         desired_playing_state=camera_on,
     )
 
-    # ===============================================
-    # ATUALIZAÇÃO DA INTERFACE (Roda a cada 1 segundo)
-    # ===============================================
-    # Verifica se o componente de vídeo (ctx) está rodando e se o processador já foi criado.
-    if ctx and ctx.state.playing and ctx.video_processor:
-        # Pega uma referência ao nosso processador (o objeto 'MeuProcessadorDeVideo').
-        vp = ctx.video_processor
+    st.subheader("Histórico em Tempo Real")
+    # Instancia o gráfico uma única vez e adiciona linhas com add_rows() para não piscar a tela
+    chart = st.line_chart(pd.DataFrame({"BPM": pd.Series(dtype=float)}))
 
-        # Pega o valor do BPM de dentro do processador de forma segura.
-        bpm_val = float(vp.bpm) if vp.bpm and vp.bpm > 0 else 0.0
-        # Pega o status do dedo de forma segura.
-        dedo_ok = getattr(vp, 'dedo_detectado', False)
+    if ctx and ctx.state.playing:
+        while ctx.state.playing:
+            vp = ctx.video_processor
+            if vp is None:
+                time.sleep(0.2)
+                continue
 
-        # --- Atualiza os Placeholders ---
-        if not dedo_ok: # Se o dedo não está na câmera...
-            # Atualiza o placeholder 'status_display' com um aviso.
-            status_display.warning(
-                "👆 **Posicione o dedo** cobrindo a câmera e o flash.")
-        elif bpm_val <= 0: # Se o dedo está, mas o BPM é zero (calculando)...
-            status_display.info("⏳ **Calculando...** mantenha o dedo parado.")
-        else: # Se o BPM é válido...
-            status_display.success("✅ **Leitura Estável!**")
+            with vp.lock:
+                bpm_val = float(vp.bpm)
+                spo2_val = float(vp.spo2)
+                dedo_ok = bool(vp.dedo_detectado)
+                progresso = min(100, int((len(vp.buffer_R) / vp.min_samples) * 100))
 
-        if bpm_val > 0: # Se o BPM é válido...
-            # Atualiza o placeholder 'bpm_display' com o valor e um coração.
-            bpm_display.metric(label="BPM", value=f"{bpm_val:.0f}", delta="❤️")
-            # Adiciona o valor ao histórico do gráfico.
-            st.session_state.bpm_series.append(bpm_val)
-            # Se o histórico (gráfico) ficou muito longo...
-            if len(st.session_state.bpm_series) > MAX_POINTS:
-                # Remove os pontos mais antigos (mantém apenas os últimos 180).
-                st.session_state.bpm_series = st.session_state.bpm_series[-MAX_POINTS:]
-        else: # Se o BPM é zero...
-            # Mostra "--" no placeholder 'bpm_display'.
-            bpm_display.metric(label="BPM", value="--", delta_color="off")
+            if not dedo_ok:
+                status_display.warning("👆 **Posicione o dedo** cobrindo a câmera traseira e o flash.")
+            elif bpm_val <= 0:
+                status_display.info(f"⏳ **Estabilizando leitura ({progresso}%)...** mantenha o dedo parado.")
+            else:
+                status_display.success("✅ **Leitura Estabilizada!**")
 
-    else: # Se a câmera não está ligada...
-        status_display.info("Aguardando inicialização da câmera...")
-        bpm_display.metric(label="BPM", value="--")
+            if bpm_val > 0:
+                bpm_display.metric(label="Frequência Cardíaca", value=f"{bpm_val:.0f} BPM", delta="❤️")
+                chart.add_rows(pd.DataFrame({"BPM": [round(bpm_val, 1)]}))
+            else:
+                bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
 
-    # --- Desenho do Gráfico ---
-    st.subheader("Histórico") # Título da seção do gráfico.
-    bpm_chart_placeholder = st.empty() # Placeholder para o gráfico.
+            if spo2_val > 0:
+                spo2_display.metric(label="Oximetria (SpO2)", value=f"{spo2_val:.1f} %", delta="🩸")
+            else:
+                spo2_display.metric(label="Oximetria (SpO2)", value="-- %")
 
-    # Se houver pelo menos 1 ponto no histórico...
-    if len(st.session_state.bpm_series) >= 1:
-        # Desenha o gráfico de linha no placeholder.
-        bpm_chart_placeholder.line_chart(st.session_state.bpm_series)
-    else: # Se o histórico estiver vazio...
-        bpm_chart_placeholder.caption("O gráfico aparecerá aqui...") # Mostra um texto.
+            time.sleep(0.5)
+    else:
+        status_display.info("Aguardando inicialização da câmera traseira...")
+        bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
+        spo2_display.metric(label="Oximetria (SpO2)", value="-- %")
 
-    # --- Loop de Recarregamento (Rerun) ---
-    time.sleep(4.0) # Pausa a thread principal do Streamlit por 4 segundos.
-    st.rerun() # Força o script a rodar novamente do topo (atualizando a UI).
 
-# ==============================
-# MODO VÍDEO (upload)
-# ==============================
-else: # Se o usuário selecionou "Vídeo (upload)"...
-    st.info("Envie um vídeo curto (ex.: .mp4) com o dedo cobrindo a câmera/lanterna.")
-    # Cria o componente de upload de arquivo.
-    file = st.file_uploader("Selecionar vídeo", type=[
-                                  "mp4", "mov", "avi", "mkv"])
-    # Checkbox para pular a detecção de dedo (útil se o vídeo só tiver o dedo).
-    aplicar_limiar = st.checkbox(
-        "Aplicar limiar de dedo (vermelho alto)", value=False)
-    # Botão para iniciar a análise.
+# ==============================================================================
+# 2. MODO FACIAL / FRONTAL (rPPG: BPM + RPM)
+# ==============================================================================
+elif fonte == "Rosto (Frontal - rPPG)":
+
+    TOGGLE_KEY_FACE = "camera_rosto_on"
+    if TOGGLE_KEY_FACE not in st.session_state:
+        st.session_state[TOGGLE_KEY_FACE] = False
+    camera_face_on = st.toggle("🤳 Ligar/Desligar Câmera Frontal", key=TOGGLE_KEY_FACE)
+
+    st.divider()
+
+    col_status, col_bpm, col_rpm = st.columns([2, 1, 1])
+    with col_status:
+        status_display = st.empty()
+    with col_bpm:
+        bpm_display = st.empty()
+    with col_rpm:
+        rpm_display = st.empty()
+
+    class ProcessadorRostoRPPG(VideoProcessorBase):
+        def __init__(self):
+            # Canal Verde (G) possui maior absorção pela oxi-hemoglobina sob luz ambiente visível
+            self.buffer_G = []
+            self.timestamps = []
+            self.buffer_size = 300       # ~10s a 30 FPS
+            self.min_samples_bpm = 105   # ~3.5s para estabilizar BPM facial
+            self.min_samples_rpm = 160   # ~5.5s para estabilizar RPM
+            self.lock = threading.Lock()
+
+            self.bpm = 0.0
+            self.rpm = 0.0
+            self.estabilizador_bpm = EstabilizadorFisiologico(
+                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=1.2
+            )
+            self.estabilizador_rpm = EstabilizadorFisiologico(
+                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=0.5
+            )
+
+            self.fps = 30.0
+            self.frame_count = 0
+            self.total_frames = 0
+            self.start_time = time.time()
+
+            self.rosto_detectado = False
+            self.last_face_box = None
+            self.frames_sem_rosto = 0
+
+            # Detector facial Haar Cascade nativo do OpenCV (leve e sem dependências externas pesadas)
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+
+            self.running = True
+            self.calc_thread = threading.Thread(target=self._loop_calculo_rppg, daemon=True)
+            self.calc_thread.start()
+
+        def _loop_calculo_rppg(self):
+            """Thread dedicada à extração de BPM e RPM via rPPG."""
+            fs_uniforme = 30.0
+            while self.running:
+                time.sleep(0.5)
+                with self.lock:
+                    n_amostras = len(self.buffer_G)
+                    if not self.rosto_detectado or n_amostras < self.min_samples_bpm:
+                        continue
+                    arr_g = np.array(self.buffer_G, dtype=np.float64)
+                    arr_t = np.array(self.timestamps, dtype=np.float64)
+
+                try:
+                    g_uniforme = reamostrar_uniforme(arr_t, arr_g, fs_alvo=fs_uniforme)
+                    norm_g = (g_uniforme - np.mean(g_uniforme)) / (np.std(g_uniforme) + 1e-9)
+
+                    # 1. Filtro Cardíaco (BPM): 0.85 Hz a 2.4 Hz (51 a 144 BPM)
+                    filt_cardiaco = bandpass_filter(norm_g, 0.85, 2.4, fs_uniforme, order=3)
+                    peak_bpm_hz = estimar_frequencia_segura(
+                        filt_cardiaco, fs_uniforme, 0.85, 2.4, snr_minimo=1.45, usar_picos_tempo=True
+                    )
+                    bpm_bruto = peak_bpm_hz * 60.0
+
+                    # 2. Filtro Respiratório (RPM): 0.15 Hz a 0.4 Hz (9 a 24 respirações/min)
+                    rpm_bruto = 0.0
+                    if n_amostras >= self.min_samples_rpm:
+                        filt_resp = bandpass_filter(norm_g, 0.15, 0.4, fs_uniforme, order=2)
+                        peak_rpm_hz = estimar_frequencia_segura(
+                            filt_resp, fs_uniforme, 0.15, 0.4, snr_minimo=1.3, usar_picos_tempo=False
+                        )
+                        rpm_bruto = peak_rpm_hz * 60.0
+
+                    with self.lock:
+                        if 50.0 <= bpm_bruto <= 145.0:
+                            self.bpm = self.estabilizador_bpm.atualizar(bpm_bruto)
+                        if 9.0 <= rpm_bruto <= 24.0:
+                            self.rpm = self.estabilizador_rpm.atualizar(rpm_bruto)
+                except Exception as e:
+                    print(f"[Erro DSP rPPG]: {e}")
+                    continue
+
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            img = frame.to_ndarray(format="bgr24")
+            h, w, _ = img.shape
+
+            now = time.time()
+            self.frame_count += 1
+            self.total_frames += 1
+            elapsed = now - self.start_time
+            if elapsed >= 1.0:
+                self.fps = self.frame_count / elapsed
+                self.frame_count = 0
+                self.start_time = now
+
+            # Detecta o rosto em resolução reduzida (50%) a cada 2 frames para manter 30 FPS cravados
+            if self.total_frames % 2 == 0 or self.last_face_box is None:
+                small_gray = cv2.cvtColor(
+                    cv2.resize(img, (w // 2, h // 2)), cv2.COLOR_BGR2GRAY
+                )
+                faces = self.face_cascade.detectMultiScale(
+                    small_gray,
+                    scaleFactor=1.2,
+                    minNeighbors=5,
+                    minSize=(40, 40),
+                )
+
+                if len(faces) > 0:
+                    mx, my, mw, mh = max(faces, key=lambda r: r[2] * r[3])
+                    novo_box = np.array([mx * 2, my * 2, mw * 2, mh * 2], dtype=np.float64)
+                    if self.last_face_box is None:
+                        self.last_face_box = novo_box
+                    else:
+                        # Suaviza a posição da bounding box para que a ROI da testa não trepide
+                        self.last_face_box = 0.25 * novo_box + 0.75 * self.last_face_box
+                    self.frames_sem_rosto = 0
+                else:
+                    self.frames_sem_rosto += 1
+                    if self.frames_sem_rosto > 10:
+                        self.last_face_box = None
+
+            if self.last_face_box is not None:
+                fx, fy, fw, fh = self.last_face_box.astype(int)
+
+                # Isola a ROI da Testa (x + 0.3w, y + 0.1h, largura 0.4w, altura 0.2h)
+                tx = max(0, int(fx + 0.3 * fw))
+                ty = max(0, int(fy + 0.1 * fh))
+                tw = int(0.4 * fw)
+                th = int(0.2 * fh)
+
+                tx_end = min(w, tx + tw)
+                ty_end = min(h, ty + th)
+
+                roi_testa = img[ty:ty_end, tx:tx_end]
+
+                if roi_testa.size > 0:
+                    # Extrai a média espacial do canal Verde (índice 1 no formato BGR)
+                    mean_g = float(np.mean(roi_testa[:, :, 1]))
+
+                    with self.lock:
+                        self.rosto_detectado = True
+                        self.buffer_G.append(mean_g)
+                        self.timestamps.append(now)
+                        if len(self.buffer_G) > self.buffer_size:
+                            self.buffer_G.pop(0)
+                            self.timestamps.pop(0)
+                        bpm_atual = self.bpm
+                else:
+                    bpm_atual = 0.0
+
+                cor_testa = (0, 255, 0) if bpm_atual > 0 else (0, 255, 255)
+                cv2.rectangle(img, (fx, fy), (fx + fw, fy + fh), (255, 200, 0), 2)
+                cv2.rectangle(img, (tx, ty), (tx_end, ty_end), cor_testa, 2)
+            else:
+                with self.lock:
+                    self.rosto_detectado = False
+                    self.buffer_G.clear()
+                    self.timestamps.clear()
+                    self.estabilizador_bpm.reset()
+                    self.estabilizador_rpm.reset()
+                    self.bpm = 0.0
+                    self.rpm = 0.0
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+    video_constraints_rosto = {
+        "video": {
+            "facingMode": {"ideal": "user"},
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 30},
+            "torch": False,
+        },
+        "audio": False,
+    }
+
+    ctx_face = webrtc_streamer(
+        key="camera_rosto_rppg",
+        video_processor_factory=ProcessadorRostoRPPG,
+        media_stream_constraints=video_constraints_rosto,
+        rtc_configuration=RTC_CONFIGURATION,
+        async_processing=True,
+        desired_playing_state=camera_face_on,
+    )
+
+    st.subheader("Histórico em Tempo Real")
+    chart_face = st.line_chart(pd.DataFrame({"BPM": pd.Series(dtype=float)}))
+
+    if ctx_face and ctx_face.state.playing:
+        while ctx_face.state.playing:
+            vp = ctx_face.video_processor
+            if vp is None:
+                time.sleep(0.2)
+                continue
+
+            with vp.lock:
+                bpm_val = float(vp.bpm)
+                rpm_val = float(vp.rpm)
+                rosto_ok = bool(vp.rosto_detectado)
+                progresso = min(100, int((len(vp.buffer_G) / vp.min_samples_bpm) * 100))
+
+            if not rosto_ok:
+                status_display.warning("🙂 **Posicione seu rosto** de frente para a câmera em local iluminado.")
+            elif bpm_val <= 0:
+                status_display.info(f"⏳ **Estabilizando rPPG da testa ({progresso}%)...** evite movimentos.")
+            else:
+                status_display.success("✅ **Leitura rPPG Estabilizada!**")
+
+            if bpm_val > 0:
+                bpm_display.metric(label="Frequência Cardíaca", value=f"{bpm_val:.0f} BPM", delta="❤️")
+                chart_face.add_rows(pd.DataFrame({"BPM": [round(bpm_val, 1)]}))
+            else:
+                bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
+
+            if rpm_val > 0:
+                rpm_display.metric(label="Freq. Respiratória", value=f"{rpm_val:.0f} RPM", delta="🫁")
+            else:
+                rpm_display.metric(label="Freq. Respiratória", value="-- RPM")
+
+            time.sleep(0.5)
+    else:
+        status_display.info("Aguardando inicialização da câmera frontal...")
+        bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
+        rpm_display.metric(label="Freq. Respiratória", value="-- RPM")
+
+
+# ==============================================================================
+# 3. MODO VÍDEO (Upload)
+# ==============================================================================
+else:
+    st.info("Envie um vídeo curto (ex.: .mp4) para extrair BPM e SpO2 offline.")
+    file = st.file_uploader("Selecionar vídeo", type=["mp4", "mov", "avi", "mkv"])
+    aplicar_limiar = st.checkbox("Aplicar limiar de dedo (vermelho alto)", value=False)
     iniciar = st.button("▶️ Analisar vídeo")
 
-    # Placeholders para os resultados.
-    bpm_video_placeholder = st.empty()
-    debug_placeholder = st.empty()
+    col_v_bpm, col_v_spo2 = st.columns(2)
+    metric_v_bpm = col_v_bpm.empty()
+    metric_v_spo2 = col_v_spo2.empty()
+
+    chart_video = st.line_chart(pd.DataFrame({"BPM": pd.Series(dtype=float)}))
     frame_preview = st.empty()
 
-    # Se o usuário clicou em "Analisar" E um arquivo foi enviado...
     if iniciar and file is not None:
-        # Cria um arquivo temporário de forma segura (para o OpenCV poder lê-lo).
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
-            tmp.write(file.read()) # Escreve os dados do upload no arquivo temporário.
-            temp_path = tmp.name # Salva o caminho do arquivo temporário.
+            tmp.write(file.read())
+            temp_path = tmp.name
 
-        # Abre o arquivo de vídeo temporário com o OpenCV.
         cap = cv2.VideoCapture(temp_path)
-        # Pega o FPS do arquivo de vídeo (ou usa 30 como padrão).
         fps_file = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        # Demais variáveis de estado para a análise.
         roi_buffer_R = []
+        roi_buffer_B = []
+        estab_bpm_v = EstabilizadorFisiologico(janela_mediana=7, alpha=0.15, max_delta_por_ciclo=1.2)
+        estab_spo2_v = EstabilizadorFisiologico(janela_mediana=7, alpha=0.15, max_delta_por_ciclo=0.4)
         bpm_display_video = 0.0
-        alpha = 0.2 # Fator de suavização (EMA).
-        RED_THRESHOLD = 10 # Limiar de vermelho (mais baixo para vídeos).
-        # Limita a análise aos primeiros 1200 frames (aprox. 40s @ 30fps).
+        spo2_display_video = 0.0
+        RED_THRESHOLD = 10.0
         max_frames = int(min(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1200, 1200))
-        bpm_series_video = [] # Histórico do gráfico para o vídeo.
 
-        # Loop 'for' que processa o vídeo frame a frame (até 'max_frames').
         for i in range(max_frames):
-            ok, frame = cap.read() # Lê um frame.
-            if not ok: # Se 'ok' for False, o vídeo acabou.
-                break # Para o loop.
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-            # Cria uma versão pequena do frame para mostrar na tela (preview).
-            small = cv2.resize(frame, (320, 240))
-            # Mostra o preview no placeholder (convertendo de BGR para RGB).
-            frame_preview.image(cv2.cvtColor(
-                small, cv2.COLOR_BGR2RGB), caption=f"Frame {i+1}")
+            if i % 3 == 0:
+                small = cv2.resize(frame, (320, 240))
+                frame_preview.image(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), caption=f"Frame {i + 1}")
 
-            # Lógica de extração do ROI (igual ao modo câmera).
             h, w, _ = frame.shape
             roi_size = int(min(h, w) * 0.5)
             x_i = (w - roi_size) // 2
             y_i = (h - roi_size) // 2
-            roi = frame[y_i:y_i + roi_size, x_i:x_i + roi_size]
+            roi = frame[y_i : y_i + roi_size, x_i : x_i + roi_size]
 
-            # Extrai a média de vermelho (sinal bruto).
-            mean_red = float(np.mean(roi[:, :, 2])) if roi.size > 0 else 0.0
-            # Verifica se o dedo está presente (ou se o checkbox foi desmarcado).
-            dedo_ok = (mean_red > RED_THRESHOLD) if aplicar_limiar else True
+            if roi.size > 0:
+                mean_bgr = np.mean(roi, axis=(0, 1))
+                mean_b = float(mean_bgr[0])
+                mean_r = float(mean_bgr[2])
+            else:
+                mean_b, mean_r = 0.0, 0.0
 
-            if dedo_ok: # Se o sinal é válido...
-                roi_buffer_R.append(mean_red) # Adiciona ao buffer.
-                if len(roi_buffer_R) > 150: # Mantém o buffer com 150 amostras.
+            dedo_ok = (mean_r > RED_THRESHOLD) if aplicar_limiar else True
+
+            if dedo_ok:
+                roi_buffer_R.append(mean_r)
+                roi_buffer_B.append(mean_b)
+                if len(roi_buffer_R) > 180:
                     roi_buffer_R.pop(0)
-                if len(roi_buffer_R) >= 60: # Se já tivermos dados suficientes...
-                    data = np.array(roi_buffer_R, dtype=np.float64)
-                    data = (data - np.mean(data)) / (np.std(data) + 1e-9) # Normaliza.
-                    
-                    try:
-                        # Trava de segurança do FPS (igual ao modo câmera).
-                        safe_fps = fps_file if fps_file > 6.0 else 30.0
-                        # Aplica o filtro passa-banda.
-                        filtered = bandpass_filter(data, 0.7, 3.0, safe_fps)
-                        
-                        # --- MÉTODO DE CÁLCULO (Domínio do Tempo) ---
-                        # (Diferente do modo câmera, que usa FFT)
-                        # Encontra os picos (batidas) no sinal já filtrado.
-                        peaks, _ = find_peaks(
-                            filtered, distance=int(0.3*safe_fps)) # Distância mínima de 0.3s entre picos.
-                        
-                        if len(peaks) >= 2: # Se encontrou pelo menos 2 picos...
-                            # Calcula a diferença (em amostras) entre os picos.
-                            # 'np.diff' calcula a diferença entre picos consecutivos.
-                            # Divide pelo FPS para ter o tempo (em segundos) entre batidas (Intervalo R-R).
-                            rr = np.diff(peaks) / safe_fps
-                            # Filtra intervalos R-R (batidas) muito rápidos ou lentos (0.3s a 2.0s).
-                            rr = rr[(rr > 0.3) & (rr < 2.0)]
-                            if len(rr) > 0: # Se sobrar algum intervalo válido...
-                                # Calcula o BPM: 60 / (tempo médio entre batidas em segundos).
-                                # Usa a 'mediana' que é mais robusta a picos falsos (outliers).
-                                bpm_now = 60.0 / np.median(rr)
-                                if 40 < bpm_now < 180: # Validação (40-180 BPM).
-                                    # Aplica suavização exponencial (EMA).
-                                    bpm_display_video = bpm_now if bpm_display_video == 0 else bpm_now * \
-                                        alpha + bpm_display_video*(1-alpha)
-                    except: # Se der erro matemático...
-                        pass # Ignora e continua.
+                    roi_buffer_B.pop(0)
 
-                    # A cada 10 frames, atualiza a interface.
-                    if i % 10 == 0 and bpm_display_video > 0:
-                        bpm_series_video.append(bpm_display_video) # Adiciona ao histórico.
-                        # Redesenha o gráfico do vídeo.
-                        bpm_video_placeholder.line_chart(bpm_series_video)
-            
-            time.sleep(0.01) # Pequena pausa para a UI não travar.
-        
-        cap.release() # Libera o arquivo de vídeo (fecha).
+                if len(roi_buffer_R) >= 75 and i % 5 == 0:
+                    arr_r = np.array(roi_buffer_R, dtype=np.float64)
+                    arr_b = np.array(roi_buffer_B, dtype=np.float64)
+                    norm_r = (arr_r - np.mean(arr_r)) / (np.std(arr_r) + 1e-9)
+                    try:
+                        safe_fps = fps_file if fps_file > 6.0 else 30.0
+                        filtered = bandpass_filter(norm_r, 0.85, 2.5, safe_fps, order=3)
+                        peak_hz = estimar_frequencia_segura(
+                            filtered, safe_fps, 0.85, 2.5, snr_minimo=1.5, usar_picos_tempo=True
+                        )
+                        bpm_now = peak_hz * 60.0
+                        if 50.0 <= bpm_now <= 150.0:
+                            bpm_display_video = estab_bpm_v.atualizar(bpm_now)
+
+                        spo2_now = calcular_spo2_empirico(arr_r, arr_b)
+                        if 70.0 <= spo2_now <= 100.0:
+                            spo2_display_video = estab_spo2_v.atualizar(spo2_now)
+                    except Exception:
+                        pass
+
+                    if bpm_display_video > 0:
+                        metric_v_bpm.metric("BPM (Vídeo)", f"{bpm_display_video:.0f} BPM")
+                        metric_v_spo2.metric("SpO2 Estimado", f"{spo2_display_video:.1f} %")
+                        chart_video.add_rows(pd.DataFrame({"BPM": [round(bpm_display_video, 1)]}))
+
+            time.sleep(0.01)
+
+        cap.release()
         try:
-            os.remove(temp_path) # Tenta apagar o arquivo temporário do disco.
-        except:
-            pass # Se não conseguir, ignora.
+            os.remove(temp_path)
+        except OSError:
+            pass
