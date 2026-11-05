@@ -972,6 +972,61 @@ def renderizar_monitor_camera_cloud(modo: str):
           animId = requestAnimationFrame(renderLoop);
         }}
 
+        // Garante que o iframe do componente herde a política de permissão de câmera do documento pai
+        try {{
+          if (window.frameElement) {{
+            window.frameElement.setAttribute("allow", "camera *; microphone *; autoplay *");
+          }}
+        }} catch (e) {{
+          console.warn("Aviso ao definir allow no frameElement:", e);
+        }}
+
+        async function obterStreamCamera(modo) {{
+          // Usa o mediaDevices da janela principal do Streamlit (que possui permissão allow="camera" no Streamlit Cloud)
+          const navPrincipal = (
+            window.parent &&
+            window.parent.navigator &&
+            window.parent.navigator.mediaDevices
+          )
+            ? window.parent.navigator
+            : navigator;
+
+          if (!navPrincipal.mediaDevices || !navPrincipal.mediaDevices.getUserMedia) {{
+            throw new Error("API de câmera (mediaDevices) indisponível neste navegador.");
+          }}
+
+          const facing = modo === "dedo" ? "environment" : "user";
+          const tentativas = [
+            {{
+              audio: false,
+              video: {{
+                facingMode: {{ ideal: facing }},
+                width: {{ ideal: 640 }},
+                height: {{ ideal: 480 }},
+                frameRate: {{ ideal: 30 }}
+              }}
+            }},
+            {{
+              audio: false,
+              video: {{ facingMode: facing }}
+            }},
+            {{
+              audio: false,
+              video: true
+            }}
+          ];
+
+          let ultimoErro = null;
+          for (const constraints of tentativas) {{
+            try {{
+              return await navPrincipal.mediaDevices.getUserMedia(constraints);
+            }} catch (err) {{
+              ultimoErro = err;
+            }}
+          }}
+          throw ultimoErro;
+        }}
+
         async function toggleCamera() {{
           if (isRunning) {{
             isRunning = false;
@@ -991,19 +1046,9 @@ def renderizar_monitor_camera_cloud(modo: str):
 
           try {{
             statusBox.className = "status-box";
-            statusBox.innerHTML = "⏳ Abrindo câmera...";
+            statusBox.innerHTML = "⏳ Solicitando acesso à câmera...";
 
-            const constraints = {{
-              audio: false,
-              video: {{
-                facingMode: {{ ideal: MODO === "dedo" ? "environment" : "user" }},
-                width: {{ ideal: 640 }},
-                height: {{ ideal: 480 }},
-                frameRate: {{ ideal: 30 }}
-              }}
-            }};
-
-            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            stream = await obterStreamCamera(MODO);
             videoEl.srcObject = stream;
             await videoEl.play();
 
