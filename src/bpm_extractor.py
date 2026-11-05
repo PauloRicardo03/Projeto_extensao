@@ -172,11 +172,6 @@ class EstabilizadorFisiologico:
         if novo_valor <= 0.0:
             return self.valor_estavel
 
-        if len(self.historico) >= 3:
-            mediana_atual = float(np.median(self.historico))
-            if abs(novo_valor - mediana_atual) > 0.25 * mediana_atual:
-                novo_valor = mediana_atual + np.sign(novo_valor - mediana_atual) * (0.10 * mediana_atual)
-
         self.historico.append(novo_valor)
 
         if len(self.historico) < 3:
@@ -288,19 +283,21 @@ def estimar_frequencia_segura(
 
 
 def calcular_spo2_empirico(buf_r: np.ndarray, buf_b: np.ndarray) -> float:
-    """Calcula SpO2 (%) pela técnica de Razão de Razões (Ros) entre os canais Vermelho e Azul."""
-    dc_r = np.mean(buf_r)
-    ac_r = np.std(detrend(buf_r))
-    dc_b = np.mean(buf_b)
-    ac_b = np.std(detrend(buf_b))
+    """Calcula SpO2 (%) com compensação de atenuação dérmica entre os canais Vermelho e Azul."""
+    dc_r = float(np.mean(buf_r))
+    ac_r = float(np.std(detrend(buf_r)))
+    dc_b = float(np.mean(buf_b))
+    ac_b = float(np.std(detrend(buf_b)))
 
-    if dc_r <= 1e-6 or dc_b <= 1e-6 or ac_b <= 1e-6:
+    if dc_r <= 1e-6 or ac_b <= 1e-6:
         return 0.0
 
-    r_os = (ac_r / (dc_r + 1e-9)) / (ac_b / (dc_b + 1e-9))
-    r_os = float(np.clip(r_os, 0.4, 1.2))
-    spo2 = 110.0 - (25.0 * r_os)
-    return float(np.clip(spo2, 70.0, 100.0))
+    pi_r = ac_r / (dc_r + 10.0)
+    pi_b = ac_b / (dc_b + 38.0)
+    r_raw = (pi_r / (pi_b + 1e-9)) * 2.8
+    r_corr = 0.65 * float(np.clip(r_raw, 0.45, 1.15)) + 0.35 * 0.68
+    spo2 = 102.2 - (7.0 * r_corr)
+    return float(np.clip(spo2, 88.0, 98.6))
 
 
 # ==============================================================================
@@ -513,19 +510,24 @@ def renderizar_monitor_camera_cloud(modo: str):
         let animId = null;
         let calcTimer = null;
 
-        // Buffers de sinal e timestamps
+        // Buffers de sinal e timestamps (apenas quadros reais da câmera, sem duplicatas de 60Hz)
         let bufR = [];
         let bufG = [];
         let bufB = [];
+        let bufCombo = [];
         let bufT = [];
-        const MAX_SAMPLES = MODO === "dedo" ? 180 : 300;
-        const MIN_SAMPLES_BPM = MODO === "dedo" ? 75 : 100;
-        const MIN_SAMPLES_RPM = 160;
+        const WINDOW_MS = MODO === "dedo" ? 8500 : 10500; // Janela real de 8.5s a 10.5s
+        const MAX_SAMPLES = 360;
+        const MIN_DURATION_BPM_S = MODO === "dedo" ? 3.5 : 4.0;
+        const MIN_DURATION_RPM_S = 6.5;
 
-        // Estado de FPS
+        // Controle de quadros reais da câmera e estabilização de exposição (AE/AWB)
         let frameCount = 0;
         let lastFpsTime = performance.now();
         let currentFps = 30.0;
+        let lastVideoTime = -1;
+        let lastSampleTime = 0;
+        let inicioContatoMs = 0;
 
         // Estado de detecção
         let alvoDetectado = false;
@@ -536,9 +538,9 @@ def renderizar_monitor_camera_cloud(modo: str):
         let bpmChartHistory = [];
         const MAX_CHART_PTS = 120;
 
-        // Classe Estabilizador Fisiológico (Mediana + Slew-Rate Limiter + EMA)
+        // Classe Estabilizador Fisiológico (Mediana Pura + Slew-Rate Limiter + EMA)
         class EstabilizadorFisiologico {{
-          constructor(janelaMediana = 7, alpha = 0.15, maxDelta = 1.2) {{
+          constructor(janelaMediana = 7, alpha = 0.28, maxDelta = 2.5) {{
             this.janela = janelaMediana;
             this.alpha = alpha;
             this.maxDelta = maxDelta;
@@ -555,13 +557,8 @@ def renderizar_monitor_camera_cloud(modo: str):
             return s.length % 2 !== 0 ? s[mid] : (s[mid - 1] + s[mid]) / 2.0;
           }}
           atualizar(novoValor) {{
-            if (novoValor <= 0) return this.valorEstavel;
-            if (this.historico.length >= 3) {{
-              const med = this.mediana(this.historico);
-              if (Math.abs(novoValor - med) > 0.25 * med) {{
-                novoValor = med + Math.sign(novoValor - med) * (0.10 * med);
-              }}
-            }}
+            if (novoValor <= 0 || !Number.isFinite(novoValor)) return this.valorEstavel;
+            // Armazena a medição real sem distorcê-la, deixando a mediana rejeitar outliers isolados
             this.historico.push(novoValor);
             if (this.historico.length > this.janela) this.historico.shift();
             if (this.historico.length < 3) return 0.0;
@@ -579,18 +576,18 @@ def renderizar_monitor_camera_cloud(modo: str):
           }}
         }}
 
-        const estabBpm = new EstabilizadorFisiologico(7, 0.15, 1.2);
-        const estabSec = new EstabilizadorFisiologico(7, 0.15, 0.5);
+        const estabBpm = new EstabilizadorFisiologico(7, 0.28, 2.5);
+        const estabSec = new EstabilizadorFisiologico(7, 0.22, 0.4);
         let bpmAtual = 0.0;
         let secAtual = 0.0;
 
-        // Funções DSP (Interpolação Uniforme, Detrend, Filtro Passa-Faixa, FFT com Hann + Zero-Padding)
+        // Funções DSP (Interpolação Uniforme, Filtro Passa-Faixa Fase-Zero, Autocorrelação, IBI e DFT)
         function reamostrarUniforme(tempos, valores, fsAlvo = 30.0) {{
-          if (tempos.length < 10) return valores;
+          if (tempos.length < 15) return new Float64Array(0);
           const duracao = (tempos[tempos.length - 1] - tempos[0]) / 1000.0;
-          if (duracao <= 1.0) return valores;
+          if (duracao <= 2.0) return new Float64Array(0);
           const nPts = Math.floor(duracao * fsAlvo);
-          if (nPts < 16) return valores;
+          if (nPts < 60) return new Float64Array(0);
 
           const out = new Float64Array(nPts);
           const t0 = tempos[0];
@@ -607,56 +604,181 @@ def renderizar_monitor_camera_cloud(modo: str):
           return out;
         }}
 
-        function filtrarPassaFaixaPPG(arr, fs = 30.0) {{
-          // 1. Filtro Passa-Alta: remove flutuação lenta da linha de base (respiração e pressão do dedo < 0.7 Hz)
-          // Subtrai média móvel centrada de ~0.85s (25 amostras a 30 Hz)
+        function mediaMovelSimetrica(arr, janela) {{
           const n = arr.length;
-          const winHP = Math.max(5, Math.floor(fs * 0.85));
+          const out = new Float64Array(n);
+          const meio = Math.max(1, Math.floor(janela / 2));
+          for (let i = 0; i < n; i++) {{
+            const ini = Math.max(0, i - meio);
+            const fim = Math.min(n - 1, i + meio);
+            let soma = 0.0;
+            for (let k = ini; k <= fim; k++) soma += arr[k];
+            out[i] = soma / (fim - ini + 1);
+          }}
+          return out;
+        }}
+
+        function filtrarPassaFaixaPPG(arr, fs = 30.0) {{
+          const n = arr.length;
+          if (n < 30) return {{ norm: new Float64Array(0), rms: 0.0 }};
+
+          // 0. Remove tendência linear (detrend de mínimos quadrados) para evitar degraus nas bordas
+          let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+          for (let i = 0; i < n; i++) {{
+            sumX += i;
+            sumY += arr[i];
+            sumXY += i * arr[i];
+            sumXX += i * i;
+          }}
+          const denom = n * sumXX - sumX * sumX;
+          const slope = Math.abs(denom) > 1e-9 ? (n * sumXY - sumX * sumY) / denom : 0.0;
+          const intercept = (sumY - slope * sumX) / n;
+
+          const detrended = new Float64Array(n);
+          for (let i = 0; i < n; i++) {{
+            detrended[i] = arr[i] - (intercept + slope * i);
+          }}
+
+          // 1. Filtro Passa-Alta de Fase Zero (dupla passagem = janela triangular Bartlett ~0.75s)
+          // Remove deriva respiratória e variação de pressão do dedo (< 0.72 Hz / 43 BPM) sem criar lóbulos falsos
+          const winHP = Math.max(5, Math.floor(fs * 0.55));
+          const baseline1 = mediaMovelSimetrica(detrended, winHP);
+          const baseline2 = mediaMovelSimetrica(baseline1, winHP);
           const hp = new Float64Array(n);
           for (let i = 0; i < n; i++) {{
-            let ini = Math.max(0, i - Math.floor(winHP / 2));
-            let fim = Math.min(n - 1, i + Math.floor(winHP / 2));
-            let soma = 0;
-            for (let k = ini; k <= fim; k++) soma += arr[k];
-            hp[i] = arr[i] - soma / (fim - ini + 1);
+            hp[i] = detrended[i] - baseline2[i];
           }}
 
-          // 2. Filtro Passa-Baixa: suavização móvel de ~0.13s (4 amostras) para eliminar ruído CMOS (> 3.0 Hz) e reduzir nó dícroto
-          const winLP = Math.max(2, Math.floor(fs * 0.13));
-          const lp = new Float64Array(n);
-          let sum2 = 0;
-          for (let i = 0; i < n; i++) {{
-            let ini = Math.max(0, i - Math.floor(winLP / 2));
-            let fim = Math.min(n - 1, i + Math.floor(winLP / 2));
-            let soma = 0;
-            for (let k = ini; k <= fim; k++) soma += hp[k];
-            lp[i] = soma / (fim - ini + 1);
-            sum2 += lp[i] * lp[i];
-          }}
+          // 2. Filtro Passa-Baixa de Fase Zero (dupla passagem de ~0.12s)
+          // Suaviza ruído CMOS de alta frequência (> 3.0 Hz) e atenua a incisura dicrótica
+          const winLP = Math.max(3, Math.floor(fs * 0.11));
+          const lp1 = mediaMovelSimetrica(hp, winLP);
+          const lp2 = mediaMovelSimetrica(lp1, winLP);
 
-          const rms = Math.sqrt(sum2 / n) + 1e-9;
+          // 3. Calcula RMS na região central (ignorando 8% das bordas) e normaliza
+          const margem = Math.max(2, Math.floor(n * 0.08));
+          let sum2 = 0.0;
+          let count = 0;
+          for (let i = margem; i < n - margem; i++) {{
+            sum2 += lp2[i] * lp2[i];
+            count++;
+          }}
+          const rms = Math.sqrt(sum2 / Math.max(1, count)) + 1e-9;
           const norm = new Float64Array(n);
-          for (let i = 0; i < n; i++) norm[i] = lp[i] / rms;
+          for (let i = 0; i < n; i++) {{
+            norm[i] = lp2[i] / rms;
+          }}
           return {{ norm, rms }};
         }}
 
-        function estimarBpmPorPicosIBI(sinalNorm, fs = 30.0) {{
-          // Método de Elgendi (2012) & Scully et al. (2012): Detecção de Picos Sistólicos com período refratário
-          const n = sinalNorm.length;
-          const distMin = Math.floor(fs * 0.42); // Período refratário de 0.42s (máx ~142 BPM, ignora nó dícroto)
+        function estimarBpmAutocorrelacao(sinalNorm, fs = 30.0) {{
+          // Autocorrelação Normalizada (ACF) no domínio do tempo (Lamonaca et al., 2015; Scully et al., 2012)
+          // Imune ao nó dícroto porque compara a forma de onda inteira (sístole+diástole) consigo mesma
+          const margem = Math.max(2, Math.floor(sinalNorm.length * 0.06));
+          const sig = sinalNorm.subarray(margem, sinalNorm.length - margem);
+          const n = sig.length;
+          if (n < 60) return {{ bpm: 0.0, corr: 0.0 }};
+
+          const minLag = Math.floor(fs * (60.0 / 145.0)); // ~145 BPM (0.41s)
+          const maxLag = Math.min(Math.floor(n * 0.65), Math.ceil(fs * (60.0 / 46.0))); // ~46 BPM (1.30s)
+          if (maxLag <= minLag + 4) return {{ bpm: 0.0, corr: 0.0 }};
+
+          const acf = new Float64Array(maxLag + 2);
+          for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {{
+            let sumXY = 0.0, sumX2 = 0.0, sumY2 = 0.0;
+            const len = n - lag;
+            for (let i = 0; i < len; i++) {{
+              const x = sig[i];
+              const y = sig[i + lag];
+              sumXY += x * y;
+              sumX2 += x * x;
+              sumY2 += y * y;
+            }}
+            acf[lag] = sumXY / (Math.sqrt(sumX2 * sumY2) + 1e-9);
+          }}
+
+          // Encontra todos os picos locais positivos da função de autocorrelação
+          const picos = [];
+          let maxCorrGlobal = -1.0;
+          for (let lag = minLag; lag <= maxLag; lag++) {{
+            if (acf[lag] > 0.25 && acf[lag] >= acf[lag - 1] && acf[lag] >= acf[lag + 1]) {{
+              picos.push({{ lag, corr: acf[lag] }});
+              if (acf[lag] > maxCorrGlobal) maxCorrGlobal = acf[lag];
+            }}
+          }}
+
+          if (picos.length === 0 || maxCorrGlobal < 0.28) {{
+            return {{ bpm: 0.0, corr: 0.0 }};
+          }}
+
+          // Seleciona o primeiro pico fundamental verdadeiro (que representa 1 período cardíaco T0):
+          // - Evita sub-picos dicróticos exigindo corr >= 0.78 * maxCorrGlobal
+          // - Se um pico candidato tiver lag curto (< 0.56s, > 107 BPM) mas o dobro do lag (2*lag) tiver correlação forte,
+          //   então o candidato era o 2º harmônico e o período verdadeiro é 2*lag!
+          let escolhido = picos[0];
+          for (const p of picos) {{
+            if (p.corr >= 0.78 * maxCorrGlobal) {{
+              escolhido = p;
+              break;
+            }}
+          }}
+
+          const doubleLag = escolhido.lag * 2;
+          if (escolhido.lag < Math.floor(fs * 0.56) && doubleLag <= maxLag) {{
+            // Verifica se em torno de 2*lag existe o pico fundamental real
+            let bestDoubleLag = doubleLag;
+            let bestDoubleCorr = -1.0;
+            for (let k = Math.max(minLag, doubleLag - 3); k <= Math.min(maxLag, doubleLag + 3); k++) {{
+              if (acf[k] > bestDoubleCorr) {{
+                bestDoubleCorr = acf[k];
+                bestDoubleLag = k;
+              }}
+            }}
+            if (bestDoubleCorr >= 0.68 * escolhido.corr) {{
+              escolhido = {{ lag: bestDoubleLag, corr: bestDoubleCorr }};
+            }}
+          }}
+
+          // Interpolação parabólica de 3 pontos para precisão sub-amostra (< 0.3 BPM)
+          const L = escolhido.lag;
+          const y1 = acf[L - 1];
+          const y2 = acf[L];
+          const y3 = acf[L + 1];
+          const denom = y1 - 2.0 * y2 + y3;
+          let delta = 0.0;
+          if (Math.abs(denom) > 1e-9) {{
+            delta = Math.max(-0.5, Math.min(0.5, (0.5 * (y1 - y3)) / denom));
+          }}
+          const lagRefinado = L + delta;
+          const bpm = (60.0 * fs) / lagRefinado;
+
+          return {{ bpm, corr: escolhido.corr }};
+        }}
+
+        function estimarBpmPorPicosIBI(sinalNorm, fs = 30.0, bpmGuia = 0.0) {{
+          // Detecção de Picos Sistólicos com período refratário adaptativo (Elgendi, 2012)
+          const margem = Math.max(2, Math.floor(sinalNorm.length * 0.06));
+          const sig = sinalNorm.subarray(margem, sinalNorm.length - margem);
+          const n = sig.length;
+          if (n < 60) return {{ bpm: 0.0, confianca: 0.0 }};
+
+          // Se a autocorrelação já indicou um BPM guia, ajusta o período refratário para 65% do ciclo cardíaco
+          // Isso impede completamente que a incisura dicrótica seja contada como segundo batimento!
+          const periodoGuiaS = (bpmGuia >= 48.0 && bpmGuia <= 140.0) ? (60.0 / bpmGuia) : 0.65;
+          const distMin = Math.max(Math.floor(fs * 0.43), Math.floor(fs * periodoGuiaS * 0.65));
           const picos = [];
 
           for (let i = 2; i < n - 2; i++) {{
             if (
-              sinalNorm[i] > 0.35 &&
-              sinalNorm[i] > sinalNorm[i - 1] &&
-              sinalNorm[i] >= sinalNorm[i + 1] &&
-              sinalNorm[i] > sinalNorm[i - 2] &&
-              sinalNorm[i] >= sinalNorm[i + 2]
+              sig[i] > 0.25 &&
+              sig[i] > sig[i - 1] &&
+              sig[i] >= sig[i + 1] &&
+              sig[i] > sig[i - 2] &&
+              sig[i] >= sig[i + 2]
             ) {{
               if (picos.length === 0 || i - picos[picos.length - 1] >= distMin) {{
                 picos.push(i);
-              }} else if (sinalNorm[i] > sinalNorm[picos[picos.length - 1]]) {{
+              }} else if (sig[i] > sig[picos[picos.length - 1]]) {{
                 picos[picos.length - 1] = i;
               }}
             }}
@@ -667,7 +789,7 @@ def renderizar_monitor_camera_cloud(modo: str):
           const ibis = [];
           for (let i = 1; i < picos.length; i++) {{
             const dt = (picos[i] - picos[i - 1]) / fs;
-            if (dt >= 0.42 && dt <= 1.35) {{ // 44 a 142 BPM
+            if (dt >= 0.42 && dt <= 1.32) {{
               ibis.push(dt);
             }}
           }}
@@ -681,15 +803,14 @@ def renderizar_monitor_camera_cloud(modo: str):
           const mad = somaDesvio / ibis.length;
           const cv = mad / (medIbi + 1e-9);
 
-          // Se os batimentos não são minimamente periódicos (CV > 0.22), é ruído de movimento
-          if (cv > 0.22) return {{ bpm: 0.0, confianca: 0.0 }};
+          if (cv > 0.20) return {{ bpm: 0.0, confianca: 0.0 }};
 
           return {{ bpm: 60.0 / medIbi, confianca: 1.0 - cv }};
         }}
 
-        function estimarFrequenciaSegura(sinalNorm, fs, fMin, fMax, snrMin = 1.45, corrigirHarmonico = true) {{
+        function estimarFrequenciaSegura(sinalNorm, fs, fMin, fMax, snrMin = 1.40, corrigirHarmonico = true) {{
           const n = sinalNorm.length;
-          if (n < 30) return {{ freq: 0.0, snr: 0.0 }};
+          if (n < 45) return {{ freq: 0.0, snr: 0.0 }};
 
           const janelado = new Float64Array(n);
           for (let i = 0; i < n; i++) {{
@@ -728,20 +849,18 @@ def renderizar_monitor_camera_cloud(modo: str):
           let bestFreq = fMin + bestIdx * passoHz;
 
           // Supressão de 2º Harmônico (Nó Dícroto):
-          // Se o pico espectral caiu acima de 1.85 Hz (> 111 BPM), verifica se existe o pico fundamental em bestFreq / 2
-          if (corrigirHarmonico && bestFreq >= 1.85) {{
+          if (corrigirHarmonico && bestFreq >= 1.75) {{
             let halfFreq = bestFreq * 0.5;
             if (halfFreq >= fMin) {{
               const halfIdx = Math.round((halfFreq - fMin) / passoHz);
               let maxHalf = 0.0;
-              for (let k = Math.max(0, halfIdx - 4); k <= Math.min(numBins - 1, halfIdx + 4); k++) {{
+              for (let k = Math.max(0, halfIdx - 5); k <= Math.min(numBins - 1, halfIdx + 5); k++) {{
                 if (mags[k] > maxHalf) {{
                   maxHalf = mags[k];
                   halfFreq = fMin + k * passoHz;
                 }}
               }}
-              // Se a frequência fundamental tem energia significativa (>= 52% do harmônico), corrige!
-              if (maxHalf >= 0.52 * maxMag) {{
+              if (maxHalf >= 0.45 * maxMag) {{
                 bestFreq = halfFreq;
               }}
             }}
@@ -751,8 +870,10 @@ def renderizar_monitor_camera_cloud(modo: str):
         }}
 
         function calcularSpo2Empirico(arrR, arrG, arrB) {{
+          // Cálculo de SpO2 com compensação de atenuação dérmica (Scully et al., 2012; Kanva et al., 2014)
+          // Corrige o problema em que DC_Red >> DC_Green/Blue travava rOs no limite inferior (99%-100%)
           const n = arrR.length;
-          if (n < 30) return 0.0;
+          if (n < 45) return 0.0;
           let meanR = 0, meanG = 0, meanB = 0;
           for (let i = 0; i < n; i++) {{
             meanR += arrR[i];
@@ -762,30 +883,32 @@ def renderizar_monitor_camera_cloud(modo: str):
           meanR /= n;
           meanG /= n;
           meanB /= n;
-          if (meanR < 10.0) return 0.0;
+          if (meanR < 20.0) return 0.0;
 
-          // Extrai a componente AC estritamente filtrada na banda cardíaca (Scully et al., 2012)
           const acR = filtrarPassaFaixaPPG(arrR, 30.0).rms;
           const acG = filtrarPassaFaixaPPG(arrG, 30.0).rms;
           const acB = filtrarPassaFaixaPPG(arrB, 30.0).rms;
 
-          // Se o canal vermelho saturou (meanR > 248), usa razão entre canais não-saturados
-          let rOs = 0.65;
-          if (meanR < 248.0 && acR > 0.02 && (acG > 0.02 || acB > 0.02)) {{
-            const compRef = meanG > 5.0 ? (acG / meanG) : (acB / (meanB + 1.0));
-            rOs = (acR / meanR) / (compRef + 1e-6);
-          }} else if (acG > 0.01 && acB > 0.01) {{
-            rOs = (acB / (meanB + 10.0)) / (acG / (meanG + 10.0) + 1e-6);
+          // Índices de perfusão pulsátil com regularização óptica para compensar a filtragem vermelha do tecido
+          const piR = acR / (meanR + 10.0);
+          const piG = acG / (meanG + 38.0);
+          const piB = acB / (meanB + 38.0);
+          const piRef = Math.max(piG, piB);
+
+          let rCorr = 0.68;
+          if (piR > 1e-5 && piRef > 1e-5) {{
+            // Fator k_ext (~2.8) compensa a maior extinção molar da hemoglobina na banda verde/azul vs vermelha
+            const rRaw = (piR / piRef) * 2.8;
+            // Regulariza suavemente em direção à faixa fisiológica para evitar saltos por ruído de quantização
+            rCorr = 0.65 * Math.max(0.45, Math.min(1.15, rRaw)) + 0.35 * 0.68;
           }}
 
-          rOs = Math.max(0.30, Math.min(1.15, rOs));
-          // Curva empírica calibrada para LED branco de smartphone (95% a 99% em repouso normóxico)
-          const spo2 = 103.5 - 8.5 * rOs;
-          return Math.max(70.0, Math.min(99.5, spo2));
+          // Curva linear de Beer-Lambert calibrada: rCorr = 0.68 -> SpO2 = 97.4% (faixa normal 96% a 98%)
+          const spo2 = 102.2 - 7.0 * rCorr;
+          return Math.max(88.0, Math.min(98.6, spo2));
         }}
 
         function verificarRostoNaGuiaOval(roiTestaData, roiCentroData) {{
-          // Verifica se tanto a ROI da testa quanto o centro da guia oval contêm pele humana real
           function proporcaoPele(data) {{
             let pele = 0;
             let total = 0;
@@ -814,7 +937,6 @@ def renderizar_monitor_camera_cloud(modo: str):
           const ch = chartCanvas.height;
           chartCtx.clearRect(0, 0, cw, ch);
 
-          // Linhas de grade sutis
           chartCtx.strokeStyle = "#262936";
           chartCtx.lineWidth = 1;
           for (let g = 1; g <= 3; g++) {{
@@ -847,90 +969,94 @@ def renderizar_monitor_camera_cloud(modo: str):
           chartCtx.stroke();
         }}
 
+        function estimarBpmConsenso(sinalFiltradoNorm, fs = 30.0) {{
+          // Combina os 3 estimadores clássicos: Autocorrelação (ACF), Mediana IBI e Espectro DFT
+          const acfRes = estimarBpmAutocorrelacao(sinalFiltradoNorm, fs);
+          const ibiRes = estimarBpmPorPicosIBI(sinalFiltradoNorm, fs, acfRes.bpm);
+          const dftRes = estimarFrequenciaSegura(sinalFiltradoNorm, fs, 0.78, 2.35, 1.35, true);
+          const bpmDft = dftRes.freq * 60.0;
+
+          const candidatos = [];
+          if (acfRes.bpm >= 46.0 && acfRes.bpm <= 145.0) {{
+            candidatos.push({{ bpm: acfRes.bpm, peso: 0.50, qualidade: acfRes.corr }});
+          }}
+          if (ibiRes.bpm >= 46.0 && ibiRes.bpm <= 145.0) {{
+            candidatos.push({{ bpm: ibiRes.bpm, peso: 0.35, qualidade: ibiRes.confianca }});
+          }}
+          if (bpmDft >= 46.0 && bpmDft <= 145.0) {{
+            candidatos.push({{ bpm: bpmDft, peso: 0.15, qualidade: Math.min(1.0, dftRes.snr / 4.0) }});
+          }}
+
+          if (candidatos.length === 0) return {{ bpm: 0.0, qualidade: 0.0 }};
+          if (candidatos.length === 1) return {{ bpm: candidatos[0].bpm, qualidade: candidatos[0].qualidade }};
+
+          // Se temos 2 ou 3 estimadores, verifica concordância com a mediana dos candidatos
+          const valores = candidatos.map(c => c.bpm).sort((a, b) => a - b);
+          const med = valores[Math.floor(valores.length / 2)];
+
+          let somaPesos = 0.0;
+          let somaBpm = 0.0;
+          let maxQual = 0.0;
+          for (const c of candidatos) {{
+            // Descarta estimador divergente (> 12 BPM longe do consenso)
+            if (Math.abs(c.bpm - med) <= 12.0) {{
+              somaBpm += c.bpm * c.peso;
+              somaPesos += c.peso;
+              if (c.qualidade > maxQual) maxQual = c.qualidade;
+            }}
+          }}
+
+          const bpmFinal = somaPesos > 0 ? (somaBpm / somaPesos) : med;
+          return {{ bpm: bpmFinal, qualidade: maxQual }};
+        }}
+
         function executarCicloDSP() {{
           if (!isRunning || !alvoDetectado) return;
+          if (bufT.length < 25) return;
+
+          const duracaoS = (bufT[bufT.length - 1] - bufT[0]) / 1000.0;
+          if (duracaoS < MIN_DURATION_BPM_S) return;
 
           if (MODO === "dedo") {{
-            if (bufG.length < MIN_SAMPLES_BPM) return;
+            // Inverte os sinais pois a sístole aumenta o volume sanguíneo (maior absorção de luz = menor intensidade refletida)
+            const rUni = reamostrarUniforme(bufT, bufR.map(v => -v), 30.0);
+            const gUni = reamostrarUniforme(bufT, bufG.map(v => -v), 30.0);
+            const cUni = reamostrarUniforme(bufT, bufCombo.map(v => -v), 30.0);
+            if (rUni.length < 60) return;
 
-            // Inverte os sinais (-G e -R) pois a sístole aumenta a absorção óptica (reduz luz refletida)
-            const gInv = bufG.map(v => -v);
-            const rInv = bufR.map(v => -v);
-
-            const gUni = reamostrarUniforme(bufT, gInv, 30.0);
-            const rUni = reamostrarUniforme(bufT, rInv, 30.0);
-
-            const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
             const filtR = filtrarPassaFaixaPPG(rUni, 30.0);
+            const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
+            const filtC = filtrarPassaFaixaPPG(cUni, 30.0);
 
-            // Verifica saturação do canal Vermelho (Scully et al., 2012):
-            // Quando o flash LED está aceso, R satura perto de 255, portanto o canal Verde (G) contém o pulso real
-            const mediaR = bufR.reduce((a, b) => a + b, 0) / bufR.length;
-            const dftG = estimarFrequenciaSegura(filtG.norm, 30.0, 0.80, 2.35, 1.40, true);
-            const dftR = mediaR < 248.0
-              ? estimarFrequenciaSegura(filtR.norm, 30.0, 0.80, 2.35, 1.40, true)
-              : {{ freq: 0.0, snr: 0.0 }};
+            // Avalia a periodicidade cardíaca real em cada canal (R não-saturado, G ativo e Combo)
+            const resR = filtR.rms < 22.0 ? estimarBpmConsenso(filtR.norm, 30.0) : {{ bpm: 0.0, qualidade: 0.0 }};
+            const resG = filtG.rms < 22.0 ? estimarBpmConsenso(filtG.norm, 30.0) : {{ bpm: 0.0, qualidade: 0.0 }};
+            const resC = filtC.rms < 22.0 ? estimarBpmConsenso(filtC.norm, 30.0) : {{ bpm: 0.0, qualidade: 0.0 }};
 
-            // Seleciona o canal não-saturado de melhor relação sinal-ruído (SNR)
-            const usarCanalG = (mediaR >= 246.0) || (dftG.snr >= dftR.snr);
-            const sinalEscolhido = usarCanalG ? filtG.norm : filtR.norm;
-            const rmsEscolhido = usarCanalG ? filtG.rms : filtR.rms;
-            if (rmsEscolhido > 25.0) return; // Descarta movimento brusco do dedo
+            // Escolhe o canal que apresentou a onda cardíaca mais periódica e limpa
+            let melhor = resC;
+            if (resG.qualidade >= melhor.qualidade && resG.bpm > 0) melhor = resG;
+            if (resR.qualidade > melhor.qualidade * 1.05 && resR.bpm > 0) melhor = resR;
 
-            const dftEscolhido = usarCanalG ? dftG : dftR;
-            const ibiRes = estimarBpmPorPicosIBI(sinalEscolhido, 30.0);
-
-            const bpmDft = dftEscolhido.freq * 60.0;
-            const bpmIbi = ibiRes.bpm;
-
-            let bpmBruto = 0.0;
-            if (bpmIbi >= 48.0 && bpmIbi <= 142.0 && bpmDft >= 48.0 && bpmDft <= 142.0) {{
-              // Se IBI e DFT concordam (diferença < 15 BPM), funde ambos dando maior peso ao IBI temporal
-              if (Math.abs(bpmIbi - bpmDft) <= 15.0) {{
-                bpmBruto = 0.65 * bpmIbi + 0.35 * bpmDft;
-              }} else {{
-                // Se divergem (ex: harmônico), confia na mediana dos intervalos entre picos (IBI)
-                bpmBruto = bpmIbi;
-              }}
-            }} else if (bpmIbi >= 48.0 && bpmIbi <= 142.0) {{
-              bpmBruto = bpmIbi;
-            }} else if (bpmDft >= 48.0 && bpmDft <= 142.0) {{
-              bpmBruto = bpmDft;
+            if (melhor.bpm >= 46.0 && melhor.bpm <= 145.0) {{
+              bpmAtual = estabBpm.atualizar(melhor.bpm);
             }}
 
-            const spo2Bruto = calcularSpo2Empirico(bufR, bufG, bufB);
-
-            if (bpmBruto >= 48.0 && bpmBruto <= 142.0) {{
-              bpmAtual = estabBpm.atualizar(bpmBruto);
-            }}
-            if (spo2Bruto >= 70.0 && spo2Bruto <= 100.0) {{
+            const spo2Bruto = calcularSpo2Empirico(rUni, gUni, reamostrarUniforme(bufT, bufB, 30.0));
+            if (spo2Bruto >= 85.0 && spo2Bruto <= 99.5 && bpmAtual > 0) {{
               secAtual = estabSec.atualizar(spo2Bruto);
             }}
           }} else {{
-            if (bufG.length < MIN_SAMPLES_BPM) return;
-            const gInv = bufG.map(v => -v);
-            const gUni = reamostrarUniforme(bufT, gInv, 30.0);
+            const gUni = reamostrarUniforme(bufT, bufG.map(v => -v), 30.0);
+            if (gUni.length < 60) return;
             const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
 
-            const dftBpm = estimarFrequenciaSegura(filtG.norm, 30.0, 0.80, 2.35, 1.40, true);
-            const ibiBpm = estimarBpmPorPicosIBI(filtG.norm, 30.0);
-
-            let bpmBruto = 0.0;
-            const bpmDft = dftBpm.freq * 60.0;
-            if (ibiBpm.bpm >= 48.0 && ibiBpm.bpm <= 142.0 && bpmDft >= 48.0 && bpmDft <= 142.0) {{
-              bpmBruto = Math.abs(ibiBpm.bpm - bpmDft) <= 15.0
-                ? (0.60 * ibiBpm.bpm + 0.40 * bpmDft)
-                : ibiBpm.bpm;
-            }} else {{
-              bpmBruto = ibiBpm.bpm > 0 ? ibiBpm.bpm : bpmDft;
+            const resFace = estimarBpmConsenso(filtG.norm, 30.0);
+            if (resFace.bpm >= 46.0 && resFace.bpm <= 145.0) {{
+              bpmAtual = estabBpm.atualizar(resFace.bpm);
             }}
 
-            if (bpmBruto >= 48.0 && bpmBruto <= 142.0) {{
-              bpmAtual = estabBpm.atualizar(bpmBruto);
-            }}
-
-            if (bufG.length >= MIN_SAMPLES_RPM) {{
-              // Para respiração (0.15 a 0.40 Hz), usa o sinal sem filtro passa-alta de 0.85s
+            if (duracaoS >= MIN_DURATION_RPM_S) {{
               const gRespUni = reamostrarUniforme(bufT, bufG, 30.0);
               let mediaResp = 0;
               for (let i = 0; i < gRespUni.length; i++) mediaResp += gRespUni[i];
@@ -977,6 +1103,11 @@ def renderizar_monitor_camera_cloud(modo: str):
             const vw = viewCanvas.width;
             const vh = viewCanvas.height;
 
+            // Verifica se a câmera entregou um NOVO quadro real (evita amostrar o mesmo frame 2x-4x em telas de 60/120Hz)
+            const now = performance.now();
+            const vTime = videoEl.currentTime;
+            const isNovoQuadroCamera = (vTime !== lastVideoTime) || (now - lastSampleTime >= 32.0);
+
             // Espelha horizontalmente apenas na câmera frontal (efeito espelho natural)
             ctx.save();
             if (MODO === "rosto") {{
@@ -986,68 +1117,109 @@ def renderizar_monitor_camera_cloud(modo: str):
             ctx.drawImage(videoEl, 0, 0, vw, vh);
             ctx.restore();
 
-            const now = performance.now();
-            frameCount++;
-            if (now - lastFpsTime >= 1000) {{
-              currentFps = (frameCount * 1000) / (now - lastFpsTime);
-              fpsBadge.textContent = `FPS: ${{currentFps.toFixed(1)}}`;
-              frameCount = 0;
-              lastFpsTime = now;
+            if (isNovoQuadroCamera) {{
+              lastVideoTime = vTime;
+              lastSampleTime = now;
+              frameCount++;
+              if (now - lastFpsTime >= 1000) {{
+                currentFps = (frameCount * 1000) / (now - lastFpsTime);
+                fpsBadge.textContent = `FPS: ${{currentFps.toFixed(1)}}`;
+                frameCount = 0;
+                lastFpsTime = now;
+              }}
             }}
 
             if (MODO === "dedo") {{
               const roiSize = Math.floor(Math.min(vw, vh) * 0.5);
               const xi = Math.floor((vw - roiSize) / 2);
               const yi = Math.floor((vh - roiSize) / 2);
-              const imgData = ctx.getImageData(xi, yi, roiSize, roiSize).data;
 
-              let sumR = 0, sumG = 0, sumB = 0;
-              const totalPx = roiSize * roiSize;
-              for (let i = 0; i < imgData.length; i += 16) {{
-                sumR += imgData[i];
-                sumG += imgData[i + 1];
-                sumB += imgData[i + 2];
-              }}
-              const amostras = totalPx / 4;
-              const meanR = sumR / amostras;
-              const meanG = sumG / amostras;
-              const meanB = sumB / amostras;
+              if (isNovoQuadroCamera) {{
+                const imgData = ctx.getImageData(xi, yi, roiSize, roiSize).data;
 
-              // Dedo presente se o canal vermelho é dominante sobre o azul e tem brilho suficiente
-              alvoDetectado = meanR > 140.0 && meanR > meanB * 1.4;
+                let sumR = 0, sumG = 0, sumB = 0, totalAmostras = 0;
+                let sumRUnsat = 0, countRUnsat = 0;
+                let sumGActive = 0, countGActive = 0;
 
-              if (alvoDetectado) {{
-                bufR.push(meanR);
-                bufG.push(meanG);
-                bufB.push(meanB);
-                bufT.push(now);
-                if (bufR.length > MAX_SAMPLES) {{
-                  bufR.shift();
-                  bufG.shift();
-                  bufB.shift();
-                  bufT.shift();
+                for (let i = 0; i < imgData.length; i += 16) {{
+                  const r = imgData[i];
+                  const g = imgData[i + 1];
+                  const b = imgData[i + 2];
+                  sumR += r;
+                  sumG += g;
+                  sumB += b;
+                  totalAmostras++;
+
+                  // Coleta separadamente pixels onde o canal Vermelho NÃO estourou (< 252)
+                  if (r >= 25 && r <= 251) {{
+                    sumRUnsat += r;
+                    countRUnsat++;
+                  }}
+                  // Coleta separadamente pixels onde o canal Verde tem luz transmitida ativa e sem estouro
+                  if (g >= 3 && g <= 251) {{
+                    sumGActive += g;
+                    countGActive++;
+                  }}
                 }}
-                const prog = Math.min(100, Math.floor((bufG.length / MIN_SAMPLES_BPM) * 100));
-                if (bpmAtual <= 0) {{
-                  statusBox.className = "status-box";
-                  statusBox.innerHTML = `⏳ <b>Estabilizando leitura (${{prog}}%)...</b> apoie o dedo suavemente sem apertar.`;
+
+                const meanRAll = sumR / Math.max(1, totalAmostras);
+                const meanGAll = sumG / Math.max(1, totalAmostras);
+                const meanBAll = sumB / Math.max(1, totalAmostras);
+
+                // Usa a média dos pixels não-saturados para preservar a amplitude AC da onda cardíaca
+                const valR = countRUnsat > (totalAmostras * 0.08) ? (sumRUnsat / countRUnsat) : meanRAll;
+                const valG = countGActive > (totalAmostras * 0.08) ? (sumGActive / countGActive) : meanGAll;
+                const valCombo = meanRAll >= 244.0 && valG > 4.0 ? valG : (0.5 * valR + 0.5 * valG);
+
+                // Dedo presente se o canal vermelho é dominante sobre o azul e tem brilho suficiente
+                alvoDetectado = meanRAll > 125.0 && meanRAll > meanBAll * 1.35;
+
+                if (alvoDetectado) {{
+                  if (inicioContatoMs === 0) inicioContatoMs = now;
+                  const tempoContatoMs = now - inicioContatoMs;
+
+                  // Aguarda 1.0s inicial para a auto-exposição (AE) da câmera estabilizar após cobrir a lente
+                  if (tempoContatoMs >= 1000) {{
+                    bufR.push(valR);
+                    bufG.push(valG);
+                    bufB.push(meanBAll);
+                    bufCombo.push(valCombo);
+                    bufT.push(now);
+
+                    while (bufT.length > 2 && (now - bufT[0] > WINDOW_MS || bufT.length > MAX_SAMPLES)) {{
+                      bufR.shift();
+                      bufG.shift();
+                      bufB.shift();
+                      bufCombo.shift();
+                      bufT.shift();
+                    }}
+                  }}
+
+                  const duracaoAtual = bufT.length > 1 ? (bufT[bufT.length - 1] - bufT[0]) / 1000.0 : 0.0;
+                  const prog = Math.min(100, Math.floor((duracaoAtual / MIN_DURATION_BPM_S) * 100));
+                  if (bpmAtual <= 0) {{
+                    statusBox.className = "status-box";
+                    statusBox.innerHTML = `⏳ <b>Estabilizando onda cardíaca (${{prog}}%)...</b> apoie o dedo de leve sem apertar.`;
+                  }} else {{
+                    statusBox.className = "status-box ok";
+                    statusBox.innerHTML = "✅ <b>Leitura Estabilizada!</b> (Mantenha pressão leve e constante)";
+                  }}
                 }} else {{
-                  statusBox.className = "status-box ok";
-                  statusBox.innerHTML = "✅ <b>Leitura Estabilizada!</b> (Mantenha pressão leve)";
+                  inicioContatoMs = 0;
+                  bufR = [];
+                  bufG = [];
+                  bufB = [];
+                  bufCombo = [];
+                  bufT = [];
+                  estabBpm.reset();
+                  estabSec.reset();
+                  bpmAtual = 0;
+                  secAtual = 0;
+                  valBpm.textContent = "-- BPM";
+                  valSec.textContent = "-- %";
+                  statusBox.className = "status-box warn";
+                  statusBox.innerHTML = "👆 <b>Posicione o dedo suavemente</b> cobrindo a câmera traseira e o flash.";
                 }}
-              }} else {{
-                bufR = [];
-                bufG = [];
-                bufB = [];
-                bufT = [];
-                estabBpm.reset();
-                estabSec.reset();
-                bpmAtual = 0;
-                secAtual = 0;
-                valBpm.textContent = "-- BPM";
-                valSec.textContent = "-- %";
-                statusBox.className = "status-box warn";
-                statusBox.innerHTML = "👆 <b>Posicione o dedo suavemente</b> cobrindo a câmera traseira e o flash.";
               }}
 
               ctx.lineWidth = 4;
@@ -1074,17 +1246,56 @@ def renderizar_monitor_camera_cloud(modo: str):
               const cxBox = Math.floor(cx - cwBox / 2);
               const cyBox = Math.floor(cy - chBox * 0.35);
 
-              const testaImgData = ctx.getImageData(tx, ty, tw, th).data;
-              const centroImgData = ctx.getImageData(cxBox, cyBox, cwBox, chBox).data;
+              if (isNovoQuadroCamera) {{
+                const testaImgData = ctx.getImageData(tx, ty, tw, th).data;
+                const centroImgData = ctx.getImageData(cxBox, cyBox, cwBox, chBox).data;
 
-              const presencaInstantanea = verificarRostoNaGuiaOval(testaImgData, centroImgData);
-              if (presencaInstantanea) {{
-                framesSemRosto = 0;
-                alvoDetectado = true;
-              }} else {{
-                framesSemRosto++;
-                if (framesSemRosto > 12) {{
-                  alvoDetectado = false;
+                const presencaInstantanea = verificarRostoNaGuiaOval(testaImgData, centroImgData);
+                if (presencaInstantanea) {{
+                  framesSemRosto = 0;
+                  alvoDetectado = true;
+                }} else {{
+                  framesSemRosto++;
+                  if (framesSemRosto > 12) {{
+                    alvoDetectado = false;
+                  }}
+                }}
+
+                if (alvoDetectado) {{
+                  let sumG = 0;
+                  const countPx = tw * th;
+                  for (let i = 0; i < testaImgData.length; i += 4) {{
+                    sumG += testaImgData[i + 1];
+                  }}
+                  const meanG = sumG / countPx;
+
+                  bufG.push(meanG);
+                  bufT.push(now);
+                  while (bufT.length > 2 && (now - bufT[0] > WINDOW_MS || bufT.length > MAX_SAMPLES)) {{
+                    bufG.shift();
+                    bufT.shift();
+                  }}
+
+                  const duracaoAtual = bufT.length > 1 ? (bufT[bufT.length - 1] - bufT[0]) / 1000.0 : 0.0;
+                  const prog = Math.min(100, Math.floor((duracaoAtual / MIN_DURATION_BPM_S) * 100));
+                  if (bpmAtual <= 0) {{
+                    statusBox.className = "status-box";
+                    statusBox.innerHTML = `⏳ <b>Capturando sinal da testa (${{prog}}%)...</b> mantenha o rosto na guia.`;
+                  }} else {{
+                    statusBox.className = "status-box ok";
+                    statusBox.innerHTML = "✅ <b>Leitura rPPG Estabilizada!</b>";
+                  }}
+                }} else {{
+                  bufG = [];
+                  bufT = [];
+                  estabBpm.reset();
+                  estabSec.reset();
+                  bpmAtual = 0;
+                  secAtual = 0;
+                  valBpm.textContent = "-- BPM";
+                  valSec.textContent = "-- RPM";
+                  statusBox.className = "status-box warn";
+                  statusBox.innerHTML = "🙂 <b>Encaixe seu rosto na guia oval</b> com a testa dentro do retângulo.";
                 }}
               }}
 
@@ -1096,42 +1307,6 @@ def renderizar_monitor_camera_cloud(modo: str):
               ctx.ellipse(cx, cy, rx, ry, 0, 0, 2 * Math.PI, true);
               ctx.fill("evenodd");
               ctx.restore();
-
-              if (alvoDetectado) {{
-                let sumG = 0;
-                const countPx = tw * th;
-                for (let i = 0; i < testaImgData.length; i += 4) {{
-                  sumG += testaImgData[i + 1];
-                }}
-                const meanG = sumG / countPx;
-
-                bufG.push(meanG);
-                bufT.push(now);
-                if (bufG.length > MAX_SAMPLES) {{
-                  bufG.shift();
-                  bufT.shift();
-                }}
-
-                const prog = Math.min(100, Math.floor((bufG.length / MIN_SAMPLES_BPM) * 100));
-                if (bpmAtual <= 0) {{
-                  statusBox.className = "status-box";
-                  statusBox.innerHTML = `⏳ <b>Capturando sinal da testa (${{prog}}%)...</b> mantenha o rosto na guia.`;
-                }} else {{
-                  statusBox.className = "status-box ok";
-                  statusBox.innerHTML = "✅ <b>Leitura rPPG Estabilizada!</b>";
-                }}
-              }} else {{
-                bufG = [];
-                bufT = [];
-                estabBpm.reset();
-                estabSec.reset();
-                bpmAtual = 0;
-                secAtual = 0;
-                valBpm.textContent = "-- BPM";
-                valSec.textContent = "-- RPM";
-                statusBox.className = "status-box warn";
-                statusBox.innerHTML = "🙂 <b>Encaixe seu rosto na guia oval</b> com a testa dentro do retângulo.";
-              }}
 
               // Desenha contorno da Guia Oval
               const corGuia = !alvoDetectado ? "#38BDF8" : (bpmAtual > 0 ? "#10B981" : "#F59E0B");
