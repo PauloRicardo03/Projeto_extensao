@@ -1195,14 +1195,25 @@ def renderizar_monitor_camera_cloud(modo: str):
 
             // Ativa a lanterna (torch) se estiver no modo Dedo
             if (MODO === "dedo") {{
+              const suportaTorch = (
+                navPrincipal.mediaDevices.getSupportedConstraints &&
+                navPrincipal.mediaDevices.getSupportedConstraints().torch
+              );
+
               if (btnTorch) {{
                 btnTorch.style.display = "inline-flex";
                 btnTorch.textContent = "🔦 Ligar Flash";
                 btnTorch.style.background = "#4C566A";
               }}
-              const ativou = await tentarAtivarTorch(stream);
-              if (!ativou) {{
-                console.warn("Lanterna não ativada automaticamente. Use o botão 🔦 Ligar Flash.");
+
+              if (!suportaTorch) {{
+                statusBox.className = "status-box warn";
+                statusBox.innerHTML = "⚠️ <b>Aviso:</b> O Firefox Mobile não suporta a API de lanterna. Abra este link no <b>Google Chrome</b> para o flash acender automaticamente!";
+              }} else {{
+                const ativou = await tentarAtivarTorch(stream);
+                if (!ativou) {{
+                  console.warn("Lanterna não ativada automaticamente. Use o botão 🔦 Ligar Flash.");
+                }}
               }}
             }} else {{
               if (btnTorch) btnTorch.style.display = "none";
