@@ -414,8 +414,7 @@ def renderizar_monitor_camera_cloud(modo: str):
         .video-wrapper {{
           position: relative;
           width: 100%;
-          max-height: 56vh;
-          aspect-ratio: 4 / 3;
+          max-height: 60vh;
           background: #0B0D12;
           border-radius: 12px;
           overflow: hidden;
@@ -429,9 +428,12 @@ def renderizar_monitor_camera_cloud(modo: str):
           display: none;
         }}
         canvas#viewCanvas {{
-          width: 100%;
-          height: 100%;
-          object-fit: cover;
+          max-width: 100%;
+          max-height: 60vh;
+          width: auto;
+          height: auto;
+          display: block;
+          border-radius: 10px;
         }}
         .chart-card {{
           background: #1A1C24;
@@ -690,44 +692,29 @@ def renderizar_monitor_camera_cloud(modo: str):
           return Math.max(70.0, Math.min(100.0, spo2));
         }}
 
-        function detectarRostoYCrCb(imgData, w, h) {{
-          const data = imgData.data;
-          const mx = Math.floor(w * 0.14);
-          const my = Math.floor(h * 0.08);
-          let sumX = 0, sumY = 0, count = 0;
-          let minX = w, maxX = 0, minY = h, maxY = 0;
-
-          for (let y = my; y < h - my; y += 2) {{
-            for (let x = mx; x < w - mx; x += 2) {{
-              const idx = (y * w + x) * 4;
-              const r = data[idx];
-              const g = data[idx + 1];
-              const b = data[idx + 2];
-
+        function verificarRostoNaGuiaOval(roiTestaData, roiCentroData) {{
+          // Verifica se tanto a ROI da testa quanto o centro da guia oval contêm pele humana real
+          function proporcaoPele(data) {{
+            let pele = 0;
+            let total = 0;
+            for (let i = 0; i < data.length; i += 8) {{
+              const r = data[i];
+              const g = data[i + 1];
+              const b = data[i + 2];
               const luma = 0.299 * r + 0.587 * g + 0.114 * b;
               const cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
               const cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-
-              if (luma > 40 && cr >= 133 && cr <= 178 && cb >= 77 && cb <= 128) {{
-                count++;
-                sumX += x;
-                sumY += y;
-                if (x < minX) minX = x;
-                if (x > maxX) maxX = x;
-                if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
+              if (luma > 35 && luma < 245 && cr >= 130 && cr <= 182 && cb >= 75 && cb <= 132 && r > g * 0.95) {{
+                pele++;
               }}
+              total++;
             }}
+            return total > 0 ? pele / total : 0.0;
           }}
 
-          const areaTotalAmostrada = ((w - 2 * mx) * (h - 2 * my)) / 4;
-          if (count < areaTotalAmostrada * 0.12) return null;
-
-          const fw = maxX - minX;
-          const fh = maxY - minY;
-          if (fw < w * 0.18 || fh < h * 0.20) return null;
-
-          return [minX, minY, fw, fh];
+          const ratioTesta = proporcaoPele(roiTestaData);
+          const ratioCentro = proporcaoPele(roiCentroData);
+          return ratioTesta >= 0.52 && ratioCentro >= 0.52;
         }}
 
         function desenharGrafico() {{
@@ -825,9 +812,27 @@ def renderizar_monitor_camera_cloud(modo: str):
           if (!isRunning) return;
 
           if (videoEl.readyState >= videoEl.HAVE_CURRENT_DATA) {{
+            // Sincroniza a resolução do canvas com a proporção real nativa da câmera (elimina imagem esticada)
+            if (
+              videoEl.videoWidth > 0 &&
+              videoEl.videoHeight > 0 &&
+              (viewCanvas.width !== videoEl.videoWidth || viewCanvas.height !== videoEl.videoHeight)
+            ) {{
+              viewCanvas.width = videoEl.videoWidth;
+              viewCanvas.height = videoEl.videoHeight;
+            }}
+
             const vw = viewCanvas.width;
             const vh = viewCanvas.height;
+
+            // Espelha horizontalmente apenas na câmera frontal (efeito espelho natural)
+            ctx.save();
+            if (MODO === "rosto") {{
+              ctx.translate(vw, 0);
+              ctx.scale(-1, 1);
+            }}
             ctx.drawImage(videoEl, 0, 0, vw, vh);
+            ctx.restore();
 
             const now = performance.now();
             frameCount++;
@@ -892,40 +897,53 @@ def renderizar_monitor_camera_cloud(modo: str):
               ctx.strokeRect(xi, yi, roiSize, roiSize);
 
             }} else {{
-              // Modo Rosto (rPPG)
-              const fullData = ctx.getImageData(0, 0, vw, vh);
-              const box = detectarRostoYCrCb(fullData, vw, vh);
+              // Modo Rosto (rPPG com Guia Biométrica Oval Fixa + ROI Anatômica da Testa)
+              const menorDim = Math.min(vw, vh);
+              const cx = Math.floor(vw * 0.5);
+              const cy = Math.floor(vh * 0.48);
+              const rx = Math.floor(menorDim * 0.30);
+              const ry = Math.floor(menorDim * 0.39);
 
-              if (box) {{
-                if (!lastFaceBox) {{
-                  lastFaceBox = box;
-                }} else {{
-                  lastFaceBox = [
-                    0.25 * box[0] + 0.75 * lastFaceBox[0],
-                    0.25 * box[1] + 0.75 * lastFaceBox[1],
-                    0.25 * box[2] + 0.75 * lastFaceBox[2],
-                    0.25 * box[3] + 0.75 * lastFaceBox[3],
-                  ];
-                }}
+              // Coordenadas fixas da ROI da Testa (parte superior interna do oval)
+              const tw = Math.max(24, Math.floor(rx * 0.92));
+              const th = Math.max(16, Math.floor(ry * 0.30));
+              const tx = Math.floor(cx - tw / 2);
+              const ty = Math.floor(cy - ry * 0.72);
+
+              // Região central do rosto (nariz/bochechas) para validação biométrica conjunta
+              const cwBox = Math.max(24, Math.floor(rx * 0.80));
+              const chBox = Math.max(20, Math.floor(ry * 0.40));
+              const cxBox = Math.floor(cx - cwBox / 2);
+              const cyBox = Math.floor(cy - chBox * 0.35);
+
+              const testaImgData = ctx.getImageData(tx, ty, tw, th).data;
+              const centroImgData = ctx.getImageData(cxBox, cyBox, cwBox, chBox).data;
+
+              const presencaInstantanea = verificarRostoNaGuiaOval(testaImgData, centroImgData);
+              if (presencaInstantanea) {{
                 framesSemRosto = 0;
+                alvoDetectado = true;
               }} else {{
                 framesSemRosto++;
-                if (framesSemRosto > 12) lastFaceBox = null;
+                if (framesSemRosto > 12) {{
+                  alvoDetectado = false;
+                }}
               }}
 
-              if (lastFaceBox) {{
-                alvoDetectado = true;
-                const [fx, fy, fw, fh] = lastFaceBox.map(Math.floor);
-                const tx = Math.max(0, Math.floor(fx + 0.3 * fw));
-                const ty = Math.max(0, Math.floor(fy + 0.1 * fh));
-                const tw = Math.max(10, Math.floor(0.4 * fw));
-                const th = Math.max(10, Math.floor(0.2 * fh));
+              // Máscara escura translúcida ao redor da silhueta oval para guiar o enquadramento
+              ctx.save();
+              ctx.fillStyle = "rgba(11, 13, 18, 0.48)";
+              ctx.beginPath();
+              ctx.rect(0, 0, vw, vh);
+              ctx.ellipse(cx, cy, rx, ry, 0, 0, 2 * Math.PI, true);
+              ctx.fill("evenodd");
+              ctx.restore();
 
-                const testaData = ctx.getImageData(tx, ty, tw, th).data;
+              if (alvoDetectado) {{
                 let sumG = 0;
-                const countPx = (tw * th);
-                for (let i = 0; i < testaData.length; i += 4) {{
-                  sumG += testaData[i + 1];
+                const countPx = tw * th;
+                for (let i = 0; i < testaImgData.length; i += 4) {{
+                  sumG += testaImgData[i + 1];
                 }}
                 const meanG = sumG / countPx;
 
@@ -939,22 +957,12 @@ def renderizar_monitor_camera_cloud(modo: str):
                 const prog = Math.min(100, Math.floor((bufG.length / MIN_SAMPLES_BPM) * 100));
                 if (bpmAtual <= 0) {{
                   statusBox.className = "status-box";
-                  statusBox.innerHTML = `⏳ <b>Estabilizando rPPG da testa (${{prog}}%)...</b> evite movimentos.`;
+                  statusBox.innerHTML = `⏳ <b>Capturando sinal da testa (${{prog}}%)...</b> mantenha o rosto na guia.`;
                 }} else {{
                   statusBox.className = "status-box ok";
                   statusBox.innerHTML = "✅ <b>Leitura rPPG Estabilizada!</b>";
                 }}
-
-                // Retângulo do rosto (Azul) e ROI da testa (Amarelo/Verde)
-                ctx.lineWidth = 2.5;
-                ctx.strokeStyle = "#38BDF8";
-                ctx.strokeRect(fx, fy, fw, fh);
-
-                ctx.lineWidth = 3;
-                ctx.strokeStyle = bpmAtual > 0 ? "#10B981" : "#F59E0B";
-                ctx.strokeRect(tx, ty, tw, th);
               }} else {{
-                alvoDetectado = false;
                 bufG = [];
                 bufT = [];
                 estabBpm.reset();
@@ -964,8 +972,31 @@ def renderizar_monitor_camera_cloud(modo: str):
                 valBpm.textContent = "-- BPM";
                 valSec.textContent = "-- RPM";
                 statusBox.className = "status-box warn";
-                statusBox.innerHTML = "🙂 <b>Posicione seu rosto</b> centralizado em local bem iluminado.";
+                statusBox.innerHTML = "🙂 <b>Encaixe seu rosto na guia oval</b> com a testa dentro do retângulo.";
               }}
+
+              // Desenha contorno da Guia Oval
+              const corGuia = !alvoDetectado ? "#38BDF8" : (bpmAtual > 0 ? "#10B981" : "#F59E0B");
+              ctx.save();
+              ctx.lineWidth = 3;
+              ctx.strokeStyle = corGuia;
+              ctx.setLineDash([10, 6]);
+              ctx.beginPath();
+              ctx.ellipse(cx, cy, rx, ry, 0, 0, 2 * Math.PI);
+              ctx.stroke();
+              ctx.restore();
+
+              // Desenha o retângulo da ROI da Testa
+              ctx.save();
+              ctx.lineWidth = 2.5;
+              ctx.strokeStyle = !alvoDetectado ? "rgba(255, 255, 255, 0.65)" : (bpmAtual > 0 ? "#10B981" : "#F59E0B");
+              ctx.strokeRect(tx, ty, tw, th);
+              ctx.fillStyle = "rgba(11, 13, 18, 0.65)";
+              ctx.fillRect(tx, Math.max(0, ty - 20), 76, 18);
+              ctx.fillStyle = "#FAFAFA";
+              ctx.font = "600 11px sans-serif";
+              ctx.fillText("ROI TESTA", tx + 6, Math.max(12, ty - 7));
+              ctx.restore();
             }}
           }}
 
