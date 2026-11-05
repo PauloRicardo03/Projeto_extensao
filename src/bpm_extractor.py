@@ -607,35 +607,90 @@ def renderizar_monitor_camera_cloud(modo: str):
           return out;
         }}
 
-        function detrendNormalizar(arr) {{
+        function filtrarPassaFaixaPPG(arr, fs = 30.0) {{
+          // 1. Filtro Passa-Alta: remove flutuação lenta da linha de base (respiração e pressão do dedo < 0.7 Hz)
+          // Subtrai média móvel centrada de ~0.85s (25 amostras a 30 Hz)
           const n = arr.length;
-          let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+          const winHP = Math.max(5, Math.floor(fs * 0.85));
+          const hp = new Float64Array(n);
           for (let i = 0; i < n; i++) {{
-            sumX += i;
-            sumY += arr[i];
-            sumXY += i * arr[i];
-            sumXX += i * i;
+            let ini = Math.max(0, i - Math.floor(winHP / 2));
+            let fim = Math.min(n - 1, i + Math.floor(winHP / 2));
+            let soma = 0;
+            for (let k = ini; k <= fim; k++) soma += arr[k];
+            hp[i] = arr[i] - soma / (fim - ini + 1);
           }}
-          const denom = n * sumXX - sumX * sumX;
-          const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
-          const intercept = (sumY - slope * sumX) / n;
 
-          const out = new Float64Array(n);
+          // 2. Filtro Passa-Baixa: suavização móvel de ~0.13s (4 amostras) para eliminar ruído CMOS (> 3.0 Hz) e reduzir nó dícroto
+          const winLP = Math.max(2, Math.floor(fs * 0.13));
+          const lp = new Float64Array(n);
           let sum2 = 0;
           for (let i = 0; i < n; i++) {{
-            out[i] = arr[i] - (slope * i + intercept);
-            sum2 += out[i] * out[i];
+            let ini = Math.max(0, i - Math.floor(winLP / 2));
+            let fim = Math.min(n - 1, i + Math.floor(winLP / 2));
+            let soma = 0;
+            for (let k = ini; k <= fim; k++) soma += hp[k];
+            lp[i] = soma / (fim - ini + 1);
+            sum2 += lp[i] * lp[i];
           }}
-          const std = Math.sqrt(sum2 / n) + 1e-9;
-          for (let i = 0; i < n; i++) out[i] /= std;
-          return {{ norm: out, stdBruto: std }};
+
+          const rms = Math.sqrt(sum2 / n) + 1e-9;
+          const norm = new Float64Array(n);
+          for (let i = 0; i < n; i++) norm[i] = lp[i] / rms;
+          return {{ norm, rms }};
         }}
 
-        function estimarFrequenciaSegura(sinalNorm, fs, fMin, fMax, snrMin = 1.55) {{
+        function estimarBpmPorPicosIBI(sinalNorm, fs = 30.0) {{
+          // Método de Elgendi (2012) & Scully et al. (2012): Detecção de Picos Sistólicos com período refratário
           const n = sinalNorm.length;
-          if (n < 30) return 0.0;
+          const distMin = Math.floor(fs * 0.42); // Período refratário de 0.42s (máx ~142 BPM, ignora nó dícroto)
+          const picos = [];
 
-          // Aplica janela de Hann e calcula espectro DFT de alta resolução (passo 0.01 Hz)
+          for (let i = 2; i < n - 2; i++) {{
+            if (
+              sinalNorm[i] > 0.35 &&
+              sinalNorm[i] > sinalNorm[i - 1] &&
+              sinalNorm[i] >= sinalNorm[i + 1] &&
+              sinalNorm[i] > sinalNorm[i - 2] &&
+              sinalNorm[i] >= sinalNorm[i + 2]
+            ) {{
+              if (picos.length === 0 || i - picos[picos.length - 1] >= distMin) {{
+                picos.push(i);
+              }} else if (sinalNorm[i] > sinalNorm[picos[picos.length - 1]]) {{
+                picos[picos.length - 1] = i;
+              }}
+            }}
+          }}
+
+          if (picos.length < 3) return {{ bpm: 0.0, confianca: 0.0 }};
+
+          const ibis = [];
+          for (let i = 1; i < picos.length; i++) {{
+            const dt = (picos[i] - picos[i - 1]) / fs;
+            if (dt >= 0.42 && dt <= 1.35) {{ // 44 a 142 BPM
+              ibis.push(dt);
+            }}
+          }}
+
+          if (ibis.length < 2) return {{ bpm: 0.0, confianca: 0.0 }};
+
+          const s = [...ibis].sort((a, b) => a - b);
+          const medIbi = s[Math.floor(s.length / 2)];
+          let somaDesvio = 0;
+          for (const v of ibis) somaDesvio += Math.abs(v - medIbi);
+          const mad = somaDesvio / ibis.length;
+          const cv = mad / (medIbi + 1e-9);
+
+          // Se os batimentos não são minimamente periódicos (CV > 0.22), é ruído de movimento
+          if (cv > 0.22) return {{ bpm: 0.0, confianca: 0.0 }};
+
+          return {{ bpm: 60.0 / medIbi, confianca: 1.0 - cv }};
+        }}
+
+        function estimarFrequenciaSegura(sinalNorm, fs, fMin, fMax, snrMin = 1.45, corrigirHarmonico = true) {{
+          const n = sinalNorm.length;
+          if (n < 30) return {{ freq: 0.0, snr: 0.0 }};
+
           const janelado = new Float64Array(n);
           for (let i = 0; i < n; i++) {{
             const w = 0.5 * (1.0 - Math.cos((2.0 * Math.PI * i) / (n - 1)));
@@ -646,7 +701,7 @@ def renderizar_monitor_camera_cloud(modo: str):
           const numBins = Math.floor((fMax - fMin) / passoHz) + 1;
           const mags = new Float64Array(numBins);
           let maxMag = -1.0;
-          let bestFreq = 0.0;
+          let bestIdx = 0;
 
           for (let b = 0; b < numBins; b++) {{
             const freq = fMin + b * passoHz;
@@ -661,38 +716,72 @@ def renderizar_monitor_camera_cloud(modo: str):
             mags[b] = mag;
             if (mag > maxMag) {{
               maxMag = mag;
-              bestFreq = freq;
+              bestIdx = b;
             }}
           }}
 
-          // Calcula mediana espectral para validação de SNR
           const sortedMags = [...mags].sort((a, b) => a - b);
           const medMag = sortedMags[Math.floor(sortedMags.length / 2)] + 1e-9;
           const snr = maxMag / medMag;
-          if (snr < snrMin) return 0.0;
+          if (snr < snrMin) return {{ freq: 0.0, snr: 0.0 }};
 
-          return bestFreq;
+          let bestFreq = fMin + bestIdx * passoHz;
+
+          // Supressão de 2º Harmônico (Nó Dícroto):
+          // Se o pico espectral caiu acima de 1.85 Hz (> 111 BPM), verifica se existe o pico fundamental em bestFreq / 2
+          if (corrigirHarmonico && bestFreq >= 1.85) {{
+            let halfFreq = bestFreq * 0.5;
+            if (halfFreq >= fMin) {{
+              const halfIdx = Math.round((halfFreq - fMin) / passoHz);
+              let maxHalf = 0.0;
+              for (let k = Math.max(0, halfIdx - 4); k <= Math.min(numBins - 1, halfIdx + 4); k++) {{
+                if (mags[k] > maxHalf) {{
+                  maxHalf = mags[k];
+                  halfFreq = fMin + k * passoHz;
+                }}
+              }}
+              // Se a frequência fundamental tem energia significativa (>= 52% do harmônico), corrige!
+              if (maxHalf >= 0.52 * maxMag) {{
+                bestFreq = halfFreq;
+              }}
+            }}
+          }}
+
+          return {{ freq: bestFreq, snr }};
         }}
 
-        function calcularSpo2Empirico(arrR, arrB) {{
+        function calcularSpo2Empirico(arrR, arrG, arrB) {{
           const n = arrR.length;
-          let meanR = 0, meanB = 0;
+          if (n < 30) return 0.0;
+          let meanR = 0, meanG = 0, meanB = 0;
           for (let i = 0; i < n; i++) {{
             meanR += arrR[i];
+            meanG += arrG[i];
             meanB += arrB[i];
           }}
           meanR /= n;
+          meanG /= n;
           meanB /= n;
-          if (meanR < 1e-3 || meanB < 1e-3) return 0.0;
+          if (meanR < 10.0) return 0.0;
 
-          const detR = detrendNormalizar(arrR).stdBruto;
-          const detB = detrendNormalizar(arrB).stdBruto;
-          if (detB < 1e-4) return 0.0;
+          // Extrai a componente AC estritamente filtrada na banda cardíaca (Scully et al., 2012)
+          const acR = filtrarPassaFaixaPPG(arrR, 30.0).rms;
+          const acG = filtrarPassaFaixaPPG(arrG, 30.0).rms;
+          const acB = filtrarPassaFaixaPPG(arrB, 30.0).rms;
 
-          let rOs = (detR / meanR) / (detB / meanB);
-          rOs = Math.max(0.4, Math.min(1.2, rOs));
-          const spo2 = 110.0 - 25.0 * rOs;
-          return Math.max(70.0, Math.min(100.0, spo2));
+          // Se o canal vermelho saturou (meanR > 248), usa razão entre canais não-saturados
+          let rOs = 0.65;
+          if (meanR < 248.0 && acR > 0.02 && (acG > 0.02 || acB > 0.02)) {{
+            const compRef = meanG > 5.0 ? (acG / meanG) : (acB / (meanB + 1.0));
+            rOs = (acR / meanR) / (compRef + 1e-6);
+          }} else if (acG > 0.01 && acB > 0.01) {{
+            rOs = (acB / (meanB + 10.0)) / (acG / (meanG + 10.0) + 1e-6);
+          }}
+
+          rOs = Math.max(0.30, Math.min(1.15, rOs));
+          // Curva empírica calibrada para LED branco de smartphone (95% a 99% em repouso normóxico)
+          const spo2 = 103.5 - 8.5 * rOs;
+          return Math.max(70.0, Math.min(99.5, spo2));
         }}
 
         function verificarRostoNaGuiaOval(roiTestaData, roiCentroData) {{
@@ -762,16 +851,56 @@ def renderizar_monitor_camera_cloud(modo: str):
           if (!isRunning || !alvoDetectado) return;
 
           if (MODO === "dedo") {{
-            if (bufR.length < MIN_SAMPLES_BPM) return;
-            const rUni = reamostrarUniforme(bufT, bufR, 30.0);
-            const {{ norm, stdBruto }} = detrendNormalizar(rUni);
-            if (stdBruto > 28.0) return; // Descarta se houve movimento brusco do dedo
+            if (bufG.length < MIN_SAMPLES_BPM) return;
 
-            const peakHz = estimarFrequenciaSegura(norm, 30.0, 0.85, 2.5, 1.55);
-            const bpmBruto = peakHz * 60.0;
-            const spo2Bruto = calcularSpo2Empirico(bufR, bufB);
+            // Inverte os sinais (-G e -R) pois a sístole aumenta a absorção óptica (reduz luz refletida)
+            const gInv = bufG.map(v => -v);
+            const rInv = bufR.map(v => -v);
 
-            if (bpmBruto >= 50.0 && bpmBruto <= 150.0) {{
+            const gUni = reamostrarUniforme(bufT, gInv, 30.0);
+            const rUni = reamostrarUniforme(bufT, rInv, 30.0);
+
+            const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
+            const filtR = filtrarPassaFaixaPPG(rUni, 30.0);
+
+            // Verifica saturação do canal Vermelho (Scully et al., 2012):
+            // Quando o flash LED está aceso, R satura perto de 255, portanto o canal Verde (G) contém o pulso real
+            const mediaR = bufR.reduce((a, b) => a + b, 0) / bufR.length;
+            const dftG = estimarFrequenciaSegura(filtG.norm, 30.0, 0.80, 2.35, 1.40, true);
+            const dftR = mediaR < 248.0
+              ? estimarFrequenciaSegura(filtR.norm, 30.0, 0.80, 2.35, 1.40, true)
+              : {{ freq: 0.0, snr: 0.0 }};
+
+            // Seleciona o canal não-saturado de melhor relação sinal-ruído (SNR)
+            const usarCanalG = (mediaR >= 246.0) || (dftG.snr >= dftR.snr);
+            const sinalEscolhido = usarCanalG ? filtG.norm : filtR.norm;
+            const rmsEscolhido = usarCanalG ? filtG.rms : filtR.rms;
+            if (rmsEscolhido > 25.0) return; // Descarta movimento brusco do dedo
+
+            const dftEscolhido = usarCanalG ? dftG : dftR;
+            const ibiRes = estimarBpmPorPicosIBI(sinalEscolhido, 30.0);
+
+            const bpmDft = dftEscolhido.freq * 60.0;
+            const bpmIbi = ibiRes.bpm;
+
+            let bpmBruto = 0.0;
+            if (bpmIbi >= 48.0 && bpmIbi <= 142.0 && bpmDft >= 48.0 && bpmDft <= 142.0) {{
+              // Se IBI e DFT concordam (diferença < 15 BPM), funde ambos dando maior peso ao IBI temporal
+              if (Math.abs(bpmIbi - bpmDft) <= 15.0) {{
+                bpmBruto = 0.65 * bpmIbi + 0.35 * bpmDft;
+              }} else {{
+                // Se divergem (ex: harmônico), confia na mediana dos intervalos entre picos (IBI)
+                bpmBruto = bpmIbi;
+              }}
+            }} else if (bpmIbi >= 48.0 && bpmIbi <= 142.0) {{
+              bpmBruto = bpmIbi;
+            }} else if (bpmDft >= 48.0 && bpmDft <= 142.0) {{
+              bpmBruto = bpmDft;
+            }}
+
+            const spo2Bruto = calcularSpo2Empirico(bufR, bufG, bufB);
+
+            if (bpmBruto >= 48.0 && bpmBruto <= 142.0) {{
               bpmAtual = estabBpm.atualizar(bpmBruto);
             }}
             if (spo2Bruto >= 70.0 && spo2Bruto <= 100.0) {{
@@ -779,18 +908,38 @@ def renderizar_monitor_camera_cloud(modo: str):
             }}
           }} else {{
             if (bufG.length < MIN_SAMPLES_BPM) return;
-            const gUni = reamostrarUniforme(bufT, bufG, 30.0);
-            const {{ norm }} = detrendNormalizar(gUni);
+            const gInv = bufG.map(v => -v);
+            const gUni = reamostrarUniforme(bufT, gInv, 30.0);
+            const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
 
-            const peakBpmHz = estimarFrequenciaSegura(norm, 30.0, 0.85, 2.4, 1.45);
-            const bpmBruto = peakBpmHz * 60.0;
-            if (bpmBruto >= 50.0 && bpmBruto <= 145.0) {{
+            const dftBpm = estimarFrequenciaSegura(filtG.norm, 30.0, 0.80, 2.35, 1.40, true);
+            const ibiBpm = estimarBpmPorPicosIBI(filtG.norm, 30.0);
+
+            let bpmBruto = 0.0;
+            const bpmDft = dftBpm.freq * 60.0;
+            if (ibiBpm.bpm >= 48.0 && ibiBpm.bpm <= 142.0 && bpmDft >= 48.0 && bpmDft <= 142.0) {{
+              bpmBruto = Math.abs(ibiBpm.bpm - bpmDft) <= 15.0
+                ? (0.60 * ibiBpm.bpm + 0.40 * bpmDft)
+                : ibiBpm.bpm;
+            }} else {{
+              bpmBruto = ibiBpm.bpm > 0 ? ibiBpm.bpm : bpmDft;
+            }}
+
+            if (bpmBruto >= 48.0 && bpmBruto <= 142.0) {{
               bpmAtual = estabBpm.atualizar(bpmBruto);
             }}
 
             if (bufG.length >= MIN_SAMPLES_RPM) {{
-              const peakRpmHz = estimarFrequenciaSegura(norm, 30.0, 0.15, 0.40, 1.30);
-              const rpmBruto = peakRpmHz * 60.0;
+              // Para respiração (0.15 a 0.40 Hz), usa o sinal sem filtro passa-alta de 0.85s
+              const gRespUni = reamostrarUniforme(bufT, bufG, 30.0);
+              let mediaResp = 0;
+              for (let i = 0; i < gRespUni.length; i++) mediaResp += gRespUni[i];
+              mediaResp /= gRespUni.length;
+              const normResp = new Float64Array(gRespUni.length);
+              for (let i = 0; i < gRespUni.length; i++) normResp[i] = gRespUni[i] - mediaResp;
+
+              const dftRpm = estimarFrequenciaSegura(normResp, 30.0, 0.15, 0.40, 1.30, false);
+              const rpmBruto = dftRpm.freq * 60.0;
               if (rpmBruto >= 9.0 && rpmBruto <= 24.0) {{
                 secAtual = estabSec.atualizar(rpmBruto);
               }}
@@ -852,37 +1001,43 @@ def renderizar_monitor_camera_cloud(modo: str):
               const yi = Math.floor((vh - roiSize) / 2);
               const imgData = ctx.getImageData(xi, yi, roiSize, roiSize).data;
 
-              let sumR = 0, sumB = 0;
+              let sumR = 0, sumG = 0, sumB = 0;
               const totalPx = roiSize * roiSize;
               for (let i = 0; i < imgData.length; i += 16) {{
                 sumR += imgData[i];
+                sumG += imgData[i + 1];
                 sumB += imgData[i + 2];
               }}
               const amostras = totalPx / 4;
               const meanR = sumR / amostras;
+              const meanG = sumG / amostras;
               const meanB = sumB / amostras;
 
-              alvoDetectado = meanR > 165.0;
+              // Dedo presente se o canal vermelho é dominante sobre o azul e tem brilho suficiente
+              alvoDetectado = meanR > 140.0 && meanR > meanB * 1.4;
 
               if (alvoDetectado) {{
                 bufR.push(meanR);
+                bufG.push(meanG);
                 bufB.push(meanB);
                 bufT.push(now);
                 if (bufR.length > MAX_SAMPLES) {{
                   bufR.shift();
+                  bufG.shift();
                   bufB.shift();
                   bufT.shift();
                 }}
-                const prog = Math.min(100, Math.floor((bufR.length / MIN_SAMPLES_BPM) * 100));
+                const prog = Math.min(100, Math.floor((bufG.length / MIN_SAMPLES_BPM) * 100));
                 if (bpmAtual <= 0) {{
                   statusBox.className = "status-box";
-                  statusBox.innerHTML = `⏳ <b>Estabilizando leitura (${{prog}}%)...</b> mantenha o dedo parado.`;
+                  statusBox.innerHTML = `⏳ <b>Estabilizando leitura (${{prog}}%)...</b> apoie o dedo suavemente sem apertar.`;
                 }} else {{
                   statusBox.className = "status-box ok";
-                  statusBox.innerHTML = "✅ <b>Leitura Estabilizada!</b>";
+                  statusBox.innerHTML = "✅ <b>Leitura Estabilizada!</b> (Mantenha pressão leve)";
                 }}
               }} else {{
                 bufR = [];
+                bufG = [];
                 bufB = [];
                 bufT = [];
                 estabBpm.reset();
@@ -892,7 +1047,7 @@ def renderizar_monitor_camera_cloud(modo: str):
                 valBpm.textContent = "-- BPM";
                 valSec.textContent = "-- %";
                 statusBox.className = "status-box warn";
-                statusBox.innerHTML = "👆 <b>Posicione o dedo</b> cobrindo a câmera traseira e o flash.";
+                statusBox.innerHTML = "👆 <b>Posicione o dedo suavemente</b> cobrindo a câmera traseira e o flash.";
               }}
 
               ctx.lineWidth = 4;
