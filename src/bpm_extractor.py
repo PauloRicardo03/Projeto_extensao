@@ -1,24 +1,23 @@
 # ==============================
 # Importação das bibliotecas
 # ==============================
-from collections import deque  # Estrutura de fila circular rápida para a mediana móvel de estabilização.
-import os                      # Usado para apagar o arquivo de vídeo temporário após a análise.
-import tempfile                # Usado para criar um arquivo temporário para salvar o vídeo do upload.
-import threading               # Para executar os cálculos de DSP em paralelo (thread) sem travar o vídeo.
-import time                    # Para registrar timestamps reais de cada frame e controlar intervalos.
+from collections import deque  # Fila circular rápida para a mediana móvel de estabilização.
+import os                      # Manipulação de caminhos e limpeza de arquivos temporários.
+import tempfile                # Criação de arquivo temporário para análise de vídeo via upload.
+import threading               # Execução de cálculos de DSP em paralelo (thread).
+import time                    # Registro de timestamps e controle de intervalos.
 
-import av                      # Biblioteca que "traduz" os frames de vídeo entre o WebRTC e o NumPy/OpenCV.
-import cv2                     # OpenCV, para processamento de imagem, recorte de ROI e detecção facial.
-import numpy as np             # NumPy, para cálculos numéricos, interpolação e manipulação matricial.
-import pandas as pd            # Pandas, usado para alimentar incrementalmente o gráfico sem piscar (add_rows).
-import streamlit as st         # Biblioteca para criar o aplicativo web e a interface interativa.
-import streamlit.components.v1 as components  # Usado para injetar o manifesto e Service Worker do PWA no navegador.
-from scipy.fft import rfft, rfftfreq  # rfft/rfftfreq: Transformada Rápida de Fourier para sinais reais.
-from scipy.signal import butter, detrend, filtfilt, find_peaks  # Filtros digitais, remoção de tendência e picos.
-from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
+import av                      # Tradução de frames de vídeo entre WebRTC e NumPy/OpenCV.
+import cv2                     # OpenCV para processamento de imagem, recorte de ROI e vídeo.
+import numpy as np             # NumPy para cálculos vetoriais, interpolação e matrizes.
+import pandas as pd            # Pandas para estruturação de séries temporais no gráfico.
+import streamlit as st         # Framework principal da interface web.
+import streamlit.components.v1 as components  # Injeção de PWA e captura direta HTML5/WebRTC.
+from scipy.fft import rfft, rfftfreq          # Transformada Rápida de Fourier para sinais reais.
+from scipy.signal import butter, detrend, filtfilt, find_peaks  # Filtros digitais Butterworth e picos.
+from streamlit_webrtc import RTCConfiguration, VideoProcessorBase
 
-# Configuração de servidor STUN público do Google:
-# Essencial para que o vídeo WebRTC funcione quando acessado pelo celular via túnel (Cloudflare/ngrok) ou redes diferentes.
+# Configuração de STUN
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
@@ -44,7 +43,6 @@ def garantir_icones_pwa():
             centro = tamanho // 2
             raio = int(tamanho * 0.38)
             cv2.circle(img, (centro, centro), raio, (75, 75, 255), -1, lineType=cv2.LINE_AA)
-            # Desenha linha de pulso (ECG) branca no centro do ícone
             pts = np.array(
                 [
                     [int(tamanho * 0.22), centro],
@@ -58,7 +56,9 @@ def garantir_icones_pwa():
                 dtype=np.int32,
             )
             espessura = max(4, tamanho // 32)
-            cv2.polylines(img, [pts], isClosed=False, color=(255, 255, 255), thickness=espessura, lineType=cv2.LINE_AA)
+            cv2.polylines(
+                img, [pts], isClosed=False, color=(255, 255, 255), thickness=espessura, lineType=cv2.LINE_AA
+            )
             cv2.imwrite(caminho_icone, img)
 
 
@@ -116,25 +116,16 @@ components.html(
 
 st.title("💡 Monitor Multiparamétrico em Tempo Real (PPG & rPPG)")
 
-# Injeta CSS personalizado para estilizar a página e impedir o efeito de "piscar" nas atualizações.
+# CSS personalizado
 st.markdown(
     """
     <style>
-    /* Esconde o texto de status "RUNNING" do componente WebRTC */
     div[data-testid="stWebRTCStatus"] { 
         display: none !important;
     }
-    /* Impede que os componentes fiquem opacos ("piscando") durante atualizações em tempo real */
     div[data-stale="true"] {
         opacity: 1 !important;
         transition: none !important;
-    }
-    /* Estilização do player de vídeo */
-    video {
-        object-fit: cover;
-        width: 100%;
-        height: 65vh;
-        border-radius: 10px;
     }
     </style>
     """,
@@ -145,7 +136,6 @@ st.markdown(
 # ==============================
 # Seleção da Fonte do Sinal
 # ==============================
-# Três modos de operação: Contato (Dedo), Remoto (Rosto/rPPG) e Offline (Upload de Vídeo).
 fonte = st.radio(
     "Fonte do sinal",
     (
@@ -158,7 +148,7 @@ fonte = st.radio(
 
 
 # ==============================
-# Estabilizador Fisiológico e Funções de DSP
+# Estabilizador Fisiológico e Funções de DSP (Backend Python)
 # ==============================
 class EstabilizadorFisiologico:
     """
@@ -175,16 +165,13 @@ class EstabilizadorFisiologico:
         self.max_delta = max_delta_por_ciclo
 
     def reset(self):
-        """Limpa o histórico quando o dedo ou rosto sai do enquadramento."""
         self.historico.clear()
         self.valor_estavel = 0.0
 
     def atualizar(self, novo_valor: float) -> float:
-        """Recebe uma nova estimativa bruta e retorna o valor estabilizado."""
         if novo_valor <= 0.0:
             return self.valor_estavel
 
-        # Se já temos leituras anteriores, amortece desvios abruptos (> 25% da mediana atual)
         if len(self.historico) >= 3:
             mediana_atual = float(np.median(self.historico))
             if abs(novo_valor - mediana_atual) > 0.25 * mediana_atual:
@@ -192,7 +179,6 @@ class EstabilizadorFisiologico:
 
         self.historico.append(novo_valor)
 
-        # Aguarda pelo menos 3 estimativas consistentes antes de exibir o primeiro valor
         if len(self.historico) < 3:
             return 0.0
 
@@ -201,22 +187,16 @@ class EstabilizadorFisiologico:
         if self.valor_estavel == 0.0:
             self.valor_estavel = alvo
         else:
-            # Slew-Rate Limiter: impede que o número salte mais que 'max_delta' em um único ciclo
             delta = alvo - self.valor_estavel
             delta_limitado = float(np.clip(delta, -self.max_delta, self.max_delta))
             proposto = self.valor_estavel + delta_limitado
-            # Média Móvel Exponencial (EMA)
             self.valor_estavel = self.alpha * proposto + (1.0 - self.alpha) * self.valor_estavel
 
         return self.valor_estavel
 
 
 def reamostrar_uniforme(timestamps: np.ndarray, valores: np.ndarray, fs_alvo: float = 30.0) -> np.ndarray:
-    """
-    No WebRTC, os frames podem chegar com pequenas variações de tempo (jitter de rede).
-    Esta função interpola os dados reais para uma grade de tempo perfeitamente uniforme (30 Hz),
-    garantindo que o filtro Butterworth e a FFT operem sem distorção espectral.
-    """
+    """Interpola amostras com jitter temporal para uma grade uniforme de 30 Hz."""
     if len(timestamps) < 10:
         return valores
     duracao = timestamps[-1] - timestamps[0]
@@ -234,10 +214,7 @@ def reamostrar_uniforme(timestamps: np.ndarray, valores: np.ndarray, fs_alvo: fl
 def bandpass_filter(
     data: np.ndarray, lowcut: float, highcut: float, fs: float, order: int = 3
 ) -> np.ndarray:
-    """
-    Remove a tendência linear (detrend) e aplica um filtro passa-faixa Butterworth bidirecional (filtfilt),
-    que preserva a fase do sinal fisiológico.
-    """
+    """Filtro passa-faixa Butterworth bidirecional (filtfilt) com detrend linear."""
     if fs <= 2.0 * highcut:
         fs = 2.0 * highcut + 1.0
 
@@ -262,20 +239,16 @@ def estimar_frequencia_segura(
     usar_picos_tempo: bool = True,
 ) -> float:
     """
-    Calcula a frequência dominante em Hz com validação de segurança:
-    1. Aplica janela de Hann + Zero-Padding (n_fft=2048) para resolução fina (< 0.9 BPM).
-    2. Avalia a Relação Sinal-Ruído (SNR): se não houver um pico claro (movimento), retorna 0.0.
-    3. Combina a leitura da FFT com a mediana dos intervalos entre picos no tempo (find_peaks).
+    Calcula a frequência dominante em Hz com janela de Hann, Zero-Padding (2048),
+    validação de relação sinal-ruído (SNR) e consenso no domínio do tempo (find_peaks).
     """
     n = len(signal_filtrado)
     if n < 30:
         return 0.0
 
-    # Janela de Hann reduz vazamento espectral nas bordas do buffer
     janela = np.hanning(n)
     sinal_janelado = signal_filtrado * janela
 
-    # Zero-Padding para 2048 pontos evita que a FFT dê saltos em degraus grandes
     fft_size = max(n, 2048)
     freqs = rfftfreq(fft_size, d=1.0 / fs)
     fft_mag = np.abs(rfft(sinal_janelado, n=fft_size))
@@ -291,7 +264,6 @@ def estimar_frequencia_segura(
     pico_mag = mag_valid[idx_max]
     mediana_mag = float(np.median(mag_valid)) + 1e-9
 
-    # Validação de Qualidade do Sinal (SQI / SNR)
     snr = pico_mag / mediana_mag
     if snr < snr_minimo:
         return 0.0
@@ -301,14 +273,12 @@ def estimar_frequencia_segura(
     if not usar_picos_tempo:
         return freq_fft
 
-    # Consenso com o domínio do tempo (distância entre batimentos sistólicos)
     dist_min = max(1, int(fs / f_max * 0.75))
     peaks, _ = find_peaks(signal_filtrado, distance=dist_min, prominence=np.std(signal_filtrado) * 0.35)
     if len(peaks) >= 3:
         ibis = np.diff(peaks) / fs
         ibis_validos = ibis[(ibis >= 1.0 / f_max) & (ibis <= 1.0 / f_min)]
         if len(ibis_validos) >= 2:
-            # Coeficiente de variação (CV): verifica se os batimentos estão regulares
             cv_ibi = np.std(ibis_validos) / (np.mean(ibis_validos) + 1e-9)
             if cv_ibi < 0.25:
                 freq_tempo = 1.0 / float(np.median(ibis_validos))
@@ -318,12 +288,7 @@ def estimar_frequencia_segura(
 
 
 def calcular_spo2_empirico(buf_r: np.ndarray, buf_b: np.ndarray) -> float:
-    """
-    Calcula a saturação de oxigênio (SpO2 %) usando a Razão de Razões (Ros):
-    - Componente DC: média estática de absorção luminosa (np.mean).
-    - Componente AC: oscilação pulsátil sem tendência (np.std).
-    - Fórmula empírica calibrada: SpO2 = 110.0 - 25.0 * Ros (limitado entre 70% e 100%).
-    """
+    """Calcula SpO2 (%) pela técnica de Razão de Razões (Ros) entre os canais Vermelho e Azul."""
     dc_r = np.mean(buf_r)
     ac_r = np.std(detrend(buf_r))
     dc_b = np.mean(buf_b)
@@ -339,514 +304,758 @@ def calcular_spo2_empirico(buf_r: np.ndarray, buf_b: np.ndarray) -> float:
 
 
 # ==============================================================================
+# MOTOR DE CAPTURA E DSP EM TEMPO REAL (COMPATÍVEL COM STREAMLIT CLOUD SEM TURN)
+# ==============================================================================
+def renderizar_monitor_camera_cloud(modo: str):
+    """
+    Renderiza o monitor de câmera executando a captura MediaDevices e o pipeline DSP
+    diretamente no cliente Web/PWA.
+    Isso elimina:
+    1. O bloqueio de portas UDP/WebRTC no firewall do Streamlit Community Cloud (que travava em 'Aguardando câmera').
+    2. Loops de permissão de câmera provocados por falhas de negociação ICE/TURN.
+    3. Qualquer atraso ou perda de FPS por rede, mantendo 30 FPS reais e gráfico a 60 FPS sem piscar.
+    """
+    modo_js = "dedo" if modo == "dedo" else "rosto"
+    html_code = f"""
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+      <meta charset="UTF-8" />
+      <style>
+        * {{
+          box-sizing: border-box;
+          font-family: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }}
+        body {{
+          margin: 0;
+          padding: 0;
+          background: transparent;
+          color: #FAFAFA;
+        }}
+        .controls-bar {{
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 12px;
+        }}
+        .btn-camera {{
+          background: #FF4B4B;
+          color: #FFFFFF;
+          border: none;
+          border-radius: 8px;
+          padding: 10px 20px;
+          font-size: 15px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.2s, transform 0.1s;
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+        }}
+        .btn-camera:hover {{
+          background: #E03E3E;
+        }}
+        .btn-camera.active {{
+          background: #3B4252;
+          border: 1px solid #FF4B4B;
+        }}
+        .fps-badge {{
+          font-size: 13px;
+          color: #A3A8B8;
+          background: #1E222B;
+          padding: 6px 12px;
+          border-radius: 6px;
+        }}
+        .status-box {{
+          padding: 12px 16px;
+          border-radius: 8px;
+          font-size: 14.5px;
+          margin-bottom: 14px;
+          border-left: 4px solid #3B82F6;
+          background: rgba(59, 130, 246, 0.14);
+          color: #E2E8F0;
+        }}
+        .status-box.warn {{
+          border-left-color: #F59E0B;
+          background: rgba(245, 158, 11, 0.15);
+        }}
+        .status-box.ok {{
+          border-left-color: #10B981;
+          background: rgba(16, 185, 129, 0.15);
+        }}
+        .metrics-grid {{
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+          margin-bottom: 14px;
+        }}
+        .metric-card {{
+          background: #1A1C24;
+          border: 1px solid #2D313E;
+          border-radius: 10px;
+          padding: 14px 16px;
+        }}
+        .metric-label {{
+          font-size: 13px;
+          color: #9CA3AF;
+          margin-bottom: 4px;
+        }}
+        .metric-value {{
+          font-size: 28px;
+          font-weight: 700;
+          color: #FAFAFA;
+        }}
+        .metric-sub {{
+          font-size: 12px;
+          color: #10B981;
+          margin-top: 2px;
+        }}
+        .video-wrapper {{
+          position: relative;
+          width: 100%;
+          max-height: 56vh;
+          aspect-ratio: 4 / 3;
+          background: #0B0D12;
+          border-radius: 12px;
+          overflow: hidden;
+          border: 1px solid #2D313E;
+          margin-bottom: 16px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }}
+        video {{
+          display: none;
+        }}
+        canvas#viewCanvas {{
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }}
+        .chart-card {{
+          background: #1A1C24;
+          border: 1px solid #2D313E;
+          border-radius: 10px;
+          padding: 12px 14px;
+        }}
+        .chart-title {{
+          font-size: 14px;
+          font-weight: 600;
+          color: #D1D5DB;
+          margin-bottom: 8px;
+          display: flex;
+          justify-content: space-between;
+        }}
+        canvas#chartCanvas {{
+          width: 100%;
+          height: 150px;
+          display: block;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="controls-bar">
+        <button id="btnToggle" class="btn-camera">📷 Ligar Câmera</button>
+        <span id="fpsBadge" class="fps-badge">FPS: --</span>
+      </div>
+
+      <div id="statusBox" class="status-box">
+        Toque em <b>Ligar Câmera</b> acima para iniciar a captura em tempo real.
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Frequência Cardíaca</div>
+          <div id="valBpm" class="metric-value">-- BPM</div>
+          <div class="metric-sub">❤️ Estabilizador Ativo</div>
+        </div>
+        <div class="metric-card">
+          <div id="labelSec" class="metric-label">{"Oximetria (SpO2)" if modo_js == "dedo" else "Freq. Respiratória"}</div>
+          <div id="valSec" class="metric-value">{"-- %" if modo_js == "dedo" else "-- RPM"}</div>
+          <div class="metric-sub">{"🩸 Razão R/B" if modo_js == "dedo" else "🫁 Banda 0.15-0.40 Hz"}</div>
+        </div>
+      </div>
+
+      <div class="video-wrapper">
+        <video id="videoEl" playsinline muted></video>
+        <canvas id="viewCanvas" width="640" height="480"></canvas>
+      </div>
+
+      <div class="chart-card">
+        <div class="chart-title">
+          <span>📈 Histórico de BPM (Tempo Real Sem Piscar)</span>
+          <span id="chartRange" style="color:#9CA3AF;font-weight:400;">60 - 100 BPM</span>
+        </div>
+        <canvas id="chartCanvas" width="640" height="150"></canvas>
+      </div>
+
+      <script>
+        const MODO = "{modo_js}";
+        const btnToggle = document.getElementById("btnToggle");
+        const statusBox = document.getElementById("statusBox");
+        const fpsBadge = document.getElementById("fpsBadge");
+        const valBpm = document.getElementById("valBpm");
+        const valSec = document.getElementById("valSec");
+        const videoEl = document.getElementById("videoEl");
+        const viewCanvas = document.getElementById("viewCanvas");
+        const ctx = viewCanvas.getContext("2d", {{ willReadFrequently: true }});
+        const chartCanvas = document.getElementById("chartCanvas");
+        const chartCtx = chartCanvas.getContext("2d");
+
+        let stream = null;
+        let isRunning = false;
+        let animId = null;
+        let calcTimer = null;
+
+        // Buffers de sinal e timestamps
+        let bufR = [];
+        let bufG = [];
+        let bufB = [];
+        let bufT = [];
+        const MAX_SAMPLES = MODO === "dedo" ? 180 : 300;
+        const MIN_SAMPLES_BPM = MODO === "dedo" ? 75 : 100;
+        const MIN_SAMPLES_RPM = 160;
+
+        // Estado de FPS
+        let frameCount = 0;
+        let lastFpsTime = performance.now();
+        let currentFps = 30.0;
+
+        // Estado de detecção
+        let alvoDetectado = false;
+        let lastFaceBox = null;
+        let framesSemRosto = 0;
+
+        // Histórico para o gráfico contínuo
+        let bpmChartHistory = [];
+        const MAX_CHART_PTS = 120;
+
+        // Classe Estabilizador Fisiológico (Mediana + Slew-Rate Limiter + EMA)
+        class EstabilizadorFisiologico {{
+          constructor(janelaMediana = 7, alpha = 0.15, maxDelta = 1.2) {{
+            this.janela = janelaMediana;
+            this.alpha = alpha;
+            this.maxDelta = maxDelta;
+            this.historico = [];
+            this.valorEstavel = 0.0;
+          }}
+          reset() {{
+            this.historico = [];
+            this.valorEstavel = 0.0;
+          }}
+          mediana(arr) {{
+            const s = [...arr].sort((a, b) => a - b);
+            const mid = Math.floor(s.length / 2);
+            return s.length % 2 !== 0 ? s[mid] : (s[mid - 1] + s[mid]) / 2.0;
+          }}
+          atualizar(novoValor) {{
+            if (novoValor <= 0) return this.valorEstavel;
+            if (this.historico.length >= 3) {{
+              const med = this.mediana(this.historico);
+              if (Math.abs(novoValor - med) > 0.25 * med) {{
+                novoValor = med + Math.sign(novoValor - med) * (0.10 * med);
+              }}
+            }}
+            this.historico.push(novoValor);
+            if (this.historico.length > this.janela) this.historico.shift();
+            if (this.historico.length < 3) return 0.0;
+
+            const alvo = this.mediana(this.historico);
+            if (this.valorEstavel === 0.0) {{
+              this.valorEstavel = alvo;
+            }} else {{
+              let delta = alvo - this.valorEstavel;
+              delta = Math.max(-this.maxDelta, Math.min(this.maxDelta, delta));
+              const proposto = this.valorEstavel + delta;
+              this.valorEstavel = this.alpha * proposto + (1.0 - this.alpha) * this.valorEstavel;
+            }}
+            return this.valorEstavel;
+          }}
+        }}
+
+        const estabBpm = new EstabilizadorFisiologico(7, 0.15, 1.2);
+        const estabSec = new EstabilizadorFisiologico(7, 0.15, 0.5);
+        let bpmAtual = 0.0;
+        let secAtual = 0.0;
+
+        // Funções DSP (Interpolação Uniforme, Detrend, Filtro Passa-Faixa, FFT com Hann + Zero-Padding)
+        function reamostrarUniforme(tempos, valores, fsAlvo = 30.0) {{
+          if (tempos.length < 10) return valores;
+          const duracao = (tempos[tempos.length - 1] - tempos[0]) / 1000.0;
+          if (duracao <= 1.0) return valores;
+          const nPts = Math.floor(duracao * fsAlvo);
+          if (nPts < 16) return valores;
+
+          const out = new Float64Array(nPts);
+          const t0 = tempos[0];
+          const dt = (tempos[tempos.length - 1] - t0) / (nPts - 1);
+          let j = 0;
+          for (let i = 0; i < nPts; i++) {{
+            const t = t0 + i * dt;
+            while (j < tempos.length - 2 && tempos[j + 1] < t) j++;
+            const tA = tempos[j], tB = tempos[j + 1];
+            const vA = valores[j], vB = valores[j + 1];
+            const frac = tB > tA ? (t - tA) / (tB - tA) : 0.0;
+            out[i] = vA + frac * (vB - vA);
+          }}
+          return out;
+        }}
+
+        function detrendNormalizar(arr) {{
+          const n = arr.length;
+          let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+          for (let i = 0; i < n; i++) {{
+            sumX += i;
+            sumY += arr[i];
+            sumXY += i * arr[i];
+            sumXX += i * i;
+          }}
+          const denom = n * sumXX - sumX * sumX;
+          const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+          const intercept = (sumY - slope * sumX) / n;
+
+          const out = new Float64Array(n);
+          let sum2 = 0;
+          for (let i = 0; i < n; i++) {{
+            out[i] = arr[i] - (slope * i + intercept);
+            sum2 += out[i] * out[i];
+          }}
+          const std = Math.sqrt(sum2 / n) + 1e-9;
+          for (let i = 0; i < n; i++) out[i] /= std;
+          return {{ norm: out, stdBruto: std }};
+        }}
+
+        function estimarFrequenciaSegura(sinalNorm, fs, fMin, fMax, snrMin = 1.55) {{
+          const n = sinalNorm.length;
+          if (n < 30) return 0.0;
+
+          // Aplica janela de Hann e calcula espectro DFT de alta resolução (passo 0.01 Hz)
+          const janelado = new Float64Array(n);
+          for (let i = 0; i < n; i++) {{
+            const w = 0.5 * (1.0 - Math.cos((2.0 * Math.PI * i) / (n - 1)));
+            janelado[i] = sinalNorm[i] * w;
+          }}
+
+          const passoHz = 0.01;
+          const numBins = Math.floor((fMax - fMin) / passoHz) + 1;
+          const mags = new Float64Array(numBins);
+          let maxMag = -1.0;
+          let bestFreq = 0.0;
+
+          for (let b = 0; b < numBins; b++) {{
+            const freq = fMin + b * passoHz;
+            const omega = (2.0 * Math.PI * freq) / fs;
+            let re = 0.0, im = 0.0;
+            for (let i = 0; i < n; i++) {{
+              const ang = omega * i;
+              re += janelado[i] * Math.cos(ang);
+              im -= janelado[i] * Math.sin(ang);
+            }}
+            const mag = Math.sqrt(re * re + im * im);
+            mags[b] = mag;
+            if (mag > maxMag) {{
+              maxMag = mag;
+              bestFreq = freq;
+            }}
+          }}
+
+          // Calcula mediana espectral para validação de SNR
+          const sortedMags = [...mags].sort((a, b) => a - b);
+          const medMag = sortedMags[Math.floor(sortedMags.length / 2)] + 1e-9;
+          const snr = maxMag / medMag;
+          if (snr < snrMin) return 0.0;
+
+          return bestFreq;
+        }}
+
+        function calcularSpo2Empirico(arrR, arrB) {{
+          const n = arrR.length;
+          let meanR = 0, meanB = 0;
+          for (let i = 0; i < n; i++) {{
+            meanR += arrR[i];
+            meanB += arrB[i];
+          }}
+          meanR /= n;
+          meanB /= n;
+          if (meanR < 1e-3 || meanB < 1e-3) return 0.0;
+
+          const detR = detrendNormalizar(arrR).stdBruto;
+          const detB = detrendNormalizar(arrB).stdBruto;
+          if (detB < 1e-4) return 0.0;
+
+          let rOs = (detR / meanR) / (detB / meanB);
+          rOs = Math.max(0.4, Math.min(1.2, rOs));
+          const spo2 = 110.0 - 25.0 * rOs;
+          return Math.max(70.0, Math.min(100.0, spo2));
+        }}
+
+        function detectarRostoYCrCb(imgData, w, h) {{
+          const data = imgData.data;
+          const mx = Math.floor(w * 0.14);
+          const my = Math.floor(h * 0.08);
+          let sumX = 0, sumY = 0, count = 0;
+          let minX = w, maxX = 0, minY = h, maxY = 0;
+
+          for (let y = my; y < h - my; y += 2) {{
+            for (let x = mx; x < w - mx; x += 2) {{
+              const idx = (y * w + x) * 4;
+              const r = data[idx];
+              const g = data[idx + 1];
+              const b = data[idx + 2];
+
+              const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+              const cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+              const cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+
+              if (luma > 40 && cr >= 133 && cr <= 178 && cb >= 77 && cb <= 128) {{
+                count++;
+                sumX += x;
+                sumY += y;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+              }}
+            }}
+          }}
+
+          const areaTotalAmostrada = ((w - 2 * mx) * (h - 2 * my)) / 4;
+          if (count < areaTotalAmostrada * 0.12) return null;
+
+          const fw = maxX - minX;
+          const fh = maxY - minY;
+          if (fw < w * 0.18 || fh < h * 0.20) return null;
+
+          return [minX, minY, fw, fh];
+        }}
+
+        function desenharGrafico() {{
+          const cw = chartCanvas.width;
+          const ch = chartCanvas.height;
+          chartCtx.clearRect(0, 0, cw, ch);
+
+          // Linhas de grade sutis
+          chartCtx.strokeStyle = "#262936";
+          chartCtx.lineWidth = 1;
+          for (let g = 1; g <= 3; g++) {{
+            const gy = (ch / 4) * g;
+            chartCtx.beginPath();
+            chartCtx.moveTo(0, gy);
+            chartCtx.lineTo(cw, gy);
+            chartCtx.stroke();
+          }}
+
+          if (bpmChartHistory.length < 2) return;
+
+          const minVal = Math.min(...bpmChartHistory);
+          const maxVal = Math.max(...bpmChartHistory);
+          const padMin = Math.floor(Math.min(55, minVal - 5));
+          const padMax = Math.ceil(Math.max(110, maxVal + 5));
+          document.getElementById("chartRange").textContent = `${{padMin}} - ${{padMax}} BPM`;
+
+          chartCtx.strokeStyle = "#FF4B4B";
+          chartCtx.lineWidth = 2.5;
+          chartCtx.beginPath();
+
+          for (let i = 0; i < bpmChartHistory.length; i++) {{
+            const x = (i / (MAX_CHART_PTS - 1)) * cw;
+            const normY = (bpmChartHistory[i] - padMin) / (padMax - padMin + 1e-6);
+            const y = ch - 12 - normY * (ch - 24);
+            if (i === 0) chartCtx.moveTo(x, y);
+            else chartCtx.lineTo(x, y);
+          }}
+          chartCtx.stroke();
+        }}
+
+        function executarCicloDSP() {{
+          if (!isRunning || !alvoDetectado) return;
+
+          if (MODO === "dedo") {{
+            if (bufR.length < MIN_SAMPLES_BPM) return;
+            const rUni = reamostrarUniforme(bufT, bufR, 30.0);
+            const {{ norm, stdBruto }} = detrendNormalizar(rUni);
+            if (stdBruto > 28.0) return; // Descarta se houve movimento brusco do dedo
+
+            const peakHz = estimarFrequenciaSegura(norm, 30.0, 0.85, 2.5, 1.55);
+            const bpmBruto = peakHz * 60.0;
+            const spo2Bruto = calcularSpo2Empirico(bufR, bufB);
+
+            if (bpmBruto >= 50.0 && bpmBruto <= 150.0) {{
+              bpmAtual = estabBpm.atualizar(bpmBruto);
+            }}
+            if (spo2Bruto >= 70.0 && spo2Bruto <= 100.0) {{
+              secAtual = estabSec.atualizar(spo2Bruto);
+            }}
+          }} else {{
+            if (bufG.length < MIN_SAMPLES_BPM) return;
+            const gUni = reamostrarUniforme(bufT, bufG, 30.0);
+            const {{ norm }} = detrendNormalizar(gUni);
+
+            const peakBpmHz = estimarFrequenciaSegura(norm, 30.0, 0.85, 2.4, 1.45);
+            const bpmBruto = peakBpmHz * 60.0;
+            if (bpmBruto >= 50.0 && bpmBruto <= 145.0) {{
+              bpmAtual = estabBpm.atualizar(bpmBruto);
+            }}
+
+            if (bufG.length >= MIN_SAMPLES_RPM) {{
+              const peakRpmHz = estimarFrequenciaSegura(norm, 30.0, 0.15, 0.40, 1.30);
+              const rpmBruto = peakRpmHz * 60.0;
+              if (rpmBruto >= 9.0 && rpmBruto <= 24.0) {{
+                secAtual = estabSec.atualizar(rpmBruto);
+              }}
+            }}
+          }}
+
+          // Atualiza UI e Gráfico
+          if (bpmAtual > 0) {{
+            valBpm.textContent = `${{Math.round(bpmAtual)}} BPM`;
+            bpmChartHistory.push(Number(bpmAtual.toFixed(1)));
+            if (bpmChartHistory.length > MAX_CHART_PTS) bpmChartHistory.shift();
+            desenharGrafico();
+          }}
+          if (secAtual > 0) {{
+            valSec.textContent = MODO === "dedo"
+              ? `${{secAtual.toFixed(1)}} %`
+              : `${{Math.round(secAtual)}} RPM`;
+          }}
+        }}
+
+        function renderLoop() {{
+          if (!isRunning) return;
+
+          if (videoEl.readyState >= videoEl.HAVE_CURRENT_DATA) {{
+            const vw = viewCanvas.width;
+            const vh = viewCanvas.height;
+            ctx.drawImage(videoEl, 0, 0, vw, vh);
+
+            const now = performance.now();
+            frameCount++;
+            if (now - lastFpsTime >= 1000) {{
+              currentFps = (frameCount * 1000) / (now - lastFpsTime);
+              fpsBadge.textContent = `FPS: ${{currentFps.toFixed(1)}}`;
+              frameCount = 0;
+              lastFpsTime = now;
+            }}
+
+            if (MODO === "dedo") {{
+              const roiSize = Math.floor(Math.min(vw, vh) * 0.5);
+              const xi = Math.floor((vw - roiSize) / 2);
+              const yi = Math.floor((vh - roiSize) / 2);
+              const imgData = ctx.getImageData(xi, yi, roiSize, roiSize).data;
+
+              let sumR = 0, sumB = 0;
+              const totalPx = roiSize * roiSize;
+              for (let i = 0; i < imgData.length; i += 16) {{
+                sumR += imgData[i];
+                sumB += imgData[i + 2];
+              }}
+              const amostras = totalPx / 4;
+              const meanR = sumR / amostras;
+              const meanB = sumB / amostras;
+
+              alvoDetectado = meanR > 165.0;
+
+              if (alvoDetectado) {{
+                bufR.push(meanR);
+                bufB.push(meanB);
+                bufT.push(now);
+                if (bufR.length > MAX_SAMPLES) {{
+                  bufR.shift();
+                  bufB.shift();
+                  bufT.shift();
+                }}
+                const prog = Math.min(100, Math.floor((bufR.length / MIN_SAMPLES_BPM) * 100));
+                if (bpmAtual <= 0) {{
+                  statusBox.className = "status-box";
+                  statusBox.innerHTML = `⏳ <b>Estabilizando leitura (${{prog}}%)...</b> mantenha o dedo parado.`;
+                }} else {{
+                  statusBox.className = "status-box ok";
+                  statusBox.innerHTML = "✅ <b>Leitura Estabilizada!</b>";
+                }}
+              }} else {{
+                bufR = [];
+                bufB = [];
+                bufT = [];
+                estabBpm.reset();
+                estabSec.reset();
+                bpmAtual = 0;
+                secAtual = 0;
+                valBpm.textContent = "-- BPM";
+                valSec.textContent = "-- %";
+                statusBox.className = "status-box warn";
+                statusBox.innerHTML = "👆 <b>Posicione o dedo</b> cobrindo a câmera traseira e o flash.";
+              }}
+
+              ctx.lineWidth = 4;
+              ctx.strokeStyle = !alvoDetectado ? "#EF4444" : (bpmAtual <= 0 ? "#F59E0B" : "#10B981");
+              ctx.strokeRect(xi, yi, roiSize, roiSize);
+
+            }} else {{
+              // Modo Rosto (rPPG)
+              const fullData = ctx.getImageData(0, 0, vw, vh);
+              const box = detectarRostoYCrCb(fullData, vw, vh);
+
+              if (box) {{
+                if (!lastFaceBox) {{
+                  lastFaceBox = box;
+                }} else {{
+                  lastFaceBox = [
+                    0.25 * box[0] + 0.75 * lastFaceBox[0],
+                    0.25 * box[1] + 0.75 * lastFaceBox[1],
+                    0.25 * box[2] + 0.75 * lastFaceBox[2],
+                    0.25 * box[3] + 0.75 * lastFaceBox[3],
+                  ];
+                }}
+                framesSemRosto = 0;
+              }} else {{
+                framesSemRosto++;
+                if (framesSemRosto > 12) lastFaceBox = null;
+              }}
+
+              if (lastFaceBox) {{
+                alvoDetectado = true;
+                const [fx, fy, fw, fh] = lastFaceBox.map(Math.floor);
+                const tx = Math.max(0, Math.floor(fx + 0.3 * fw));
+                const ty = Math.max(0, Math.floor(fy + 0.1 * fh));
+                const tw = Math.max(10, Math.floor(0.4 * fw));
+                const th = Math.max(10, Math.floor(0.2 * fh));
+
+                const testaData = ctx.getImageData(tx, ty, tw, th).data;
+                let sumG = 0;
+                const countPx = (tw * th);
+                for (let i = 0; i < testaData.length; i += 4) {{
+                  sumG += testaData[i + 1];
+                }}
+                const meanG = sumG / countPx;
+
+                bufG.push(meanG);
+                bufT.push(now);
+                if (bufG.length > MAX_SAMPLES) {{
+                  bufG.shift();
+                  bufT.shift();
+                }}
+
+                const prog = Math.min(100, Math.floor((bufG.length / MIN_SAMPLES_BPM) * 100));
+                if (bpmAtual <= 0) {{
+                  statusBox.className = "status-box";
+                  statusBox.innerHTML = `⏳ <b>Estabilizando rPPG da testa (${{prog}}%)...</b> evite movimentos.`;
+                }} else {{
+                  statusBox.className = "status-box ok";
+                  statusBox.innerHTML = "✅ <b>Leitura rPPG Estabilizada!</b>";
+                }}
+
+                // Retângulo do rosto (Azul) e ROI da testa (Amarelo/Verde)
+                ctx.lineWidth = 2.5;
+                ctx.strokeStyle = "#38BDF8";
+                ctx.strokeRect(fx, fy, fw, fh);
+
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = bpmAtual > 0 ? "#10B981" : "#F59E0B";
+                ctx.strokeRect(tx, ty, tw, th);
+              }} else {{
+                alvoDetectado = false;
+                bufG = [];
+                bufT = [];
+                estabBpm.reset();
+                estabSec.reset();
+                bpmAtual = 0;
+                secAtual = 0;
+                valBpm.textContent = "-- BPM";
+                valSec.textContent = "-- RPM";
+                statusBox.className = "status-box warn";
+                statusBox.innerHTML = "🙂 <b>Posicione seu rosto</b> centralizado em local bem iluminado.";
+              }}
+            }}
+          }}
+
+          animId = requestAnimationFrame(renderLoop);
+        }}
+
+        async function toggleCamera() {{
+          if (isRunning) {{
+            isRunning = false;
+            if (animId) cancelAnimationFrame(animId);
+            if (calcTimer) clearInterval(calcTimer);
+            if (stream) {{
+              stream.getTracks().forEach(t => t.stop());
+              stream = null;
+            }}
+            btnToggle.textContent = "📷 Ligar Câmera";
+            btnToggle.classList.remove("active");
+            statusBox.className = "status-box";
+            statusBox.innerHTML = "Câmera desligada. Toque em <b>Ligar Câmera</b> para iniciar.";
+            fpsBadge.textContent = "FPS: --";
+            return;
+          }}
+
+          try {{
+            statusBox.className = "status-box";
+            statusBox.innerHTML = "⏳ Abrindo câmera...";
+
+            const constraints = {{
+              audio: false,
+              video: {{
+                facingMode: {{ ideal: MODO === "dedo" ? "environment" : "user" }},
+                width: {{ ideal: 640 }},
+                height: {{ ideal: 480 }},
+                frameRate: {{ ideal: 30 }}
+              }}
+            }};
+
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            videoEl.srcObject = stream;
+            await videoEl.play();
+
+            // Ativa a lanterna (torch) se estiver no modo Dedo
+            if (MODO === "dedo") {{
+              const track = stream.getVideoTracks()[0];
+              if (track && track.applyConstraints) {{
+                try {{
+                  await track.applyConstraints({{ advanced: [{{ torch: true }}] }});
+                }} catch (torchErr) {{
+                  console.warn("Lanterna não suportada neste dispositivo/navegador:", torchErr);
+                }}
+              }}
+            }}
+
+            isRunning = true;
+            btnToggle.textContent = "⏹️ Desligar Câmera";
+            btnToggle.classList.add("active");
+            lastFpsTime = performance.now();
+            frameCount = 0;
+
+            animId = requestAnimationFrame(renderLoop);
+            calcTimer = setInterval(executarCicloDSP, 500);
+          }} catch (err) {{
+            statusBox.className = "status-box warn";
+            statusBox.innerHTML = `❌ <b>Erro ao acessar câmera:</b> ${{err.message || err}}. Verifique a permissão do navegador.`;
+          }}
+        }}
+
+        btnToggle.addEventListener("click", toggleCamera);
+        desenharGrafico();
+      </script>
+    </body>
+    </html>
+    """
+    components.html(html_code, height=820, scrolling=False)
+
+
+# ==============================================================================
 # 1. MODO DEDO / TRASEIRA (PPG de Contato: BPM + SpO2)
 # ==============================================================================
 if fonte == "Dedo (Traseira + Flash)":
-
-    TOGGLE_KEY = "camera_dedo_on"
-    if TOGGLE_KEY not in st.session_state:
-        st.session_state[TOGGLE_KEY] = False
-    camera_on = st.toggle("📷 Ligar/Desligar Câmera Traseira", key=TOGGLE_KEY)
-
-    st.divider()
-
-    # Colunas para exibir o status e os cards de métricas (BPM e SpO2)
-    col_status, col_bpm, col_spo2 = st.columns([2, 1, 1])
-    with col_status:
-        status_display = st.empty()
-    with col_bpm:
-        bpm_display = st.empty()
-    with col_spo2:
-        spo2_display = st.empty()
-
-    class ProcessadorDedoPPG(VideoProcessorBase):
-        def __init__(self):
-            # Buffers sincronizados para os canais Vermelho (R), Azul (B) e timestamps
-            self.buffer_R = []
-            self.buffer_B = []
-            self.timestamps = []
-            self.buffer_size = 180   # ~6s de janela a 30 FPS
-            self.min_samples = 75    # ~2.5s mínimos para iniciar o cálculo
-            self.lock = threading.Lock()
-
-            self.bpm = 0.0
-            self.spo2 = 0.0
-            self.estabilizador_bpm = EstabilizadorFisiologico(
-                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=1.2
-            )
-            self.estabilizador_spo2 = EstabilizadorFisiologico(
-                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=0.4
-            )
-
-            self.fps = 30.0
-            self.frame_count = 0
-            self.start_time = time.time()
-
-            self.dedo_detectado = False
-            self.RED_THRESHOLD = 175.0
-
-            self.running = True
-            self.calc_thread = threading.Thread(target=self._loop_calculo, daemon=True)
-            self.calc_thread.start()
-
-        def _loop_calculo(self):
-            """Thread de processamento de sinais em segundo plano (roda a cada 0.5s)."""
-            fs_uniforme = 30.0
-            while self.running:
-                time.sleep(0.5)
-                with self.lock:
-                    if not self.dedo_detectado or len(self.buffer_R) < self.min_samples:
-                        continue
-                    arr_r = np.array(self.buffer_R, dtype=np.float64)
-                    arr_b = np.array(self.buffer_B, dtype=np.float64)
-                    arr_t = np.array(self.timestamps, dtype=np.float64)
-
-                try:
-                    # 1. Reamostragem uniforme em 30 Hz
-                    r_uniforme = reamostrar_uniforme(arr_t, arr_r, fs_alvo=fs_uniforme)
-
-                    # Se houver variação abrupta de brilho (dedo escorregando), ignora a janela
-                    if np.std(detrend(r_uniforme)) > 25.0:
-                        continue
-
-                    norm_r = (r_uniforme - np.mean(r_uniforme)) / (np.std(r_uniforme) + 1e-9)
-
-                    # Filtra na banda cardíaca segura: 0.85 Hz (51 BPM) a 2.5 Hz (150 BPM)
-                    filt_r = bandpass_filter(norm_r, 0.85, 2.5, fs_uniforme, order=3)
-                    peak_hz = estimar_frequencia_segura(
-                        filt_r, fs_uniforme, 0.85, 2.5, snr_minimo=1.6, usar_picos_tempo=True
-                    )
-                    bpm_bruto = peak_hz * 60.0
-
-                    # 2. Cálculo de SpO2 (%) pelos canais R e B
-                    spo2_bruto = calcular_spo2_empirico(arr_r, arr_b)
-
-                    with self.lock:
-                        if 50.0 <= bpm_bruto <= 150.0:
-                            self.bpm = self.estabilizador_bpm.atualizar(bpm_bruto)
-                        if 70.0 <= spo2_bruto <= 100.0:
-                            self.spo2 = self.estabilizador_spo2.atualizar(spo2_bruto)
-                except Exception as e:
-                    print(f"[Erro DSP Dedo]: {e}")
-                    continue
-
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            """Executado para cada frame recebido da câmera sem bloquear o vídeo."""
-            img = frame.to_ndarray(format="bgr24")
-            h, w, _ = img.shape
-
-            # ROI Central (50% da menor dimensão)
-            roi_size = int(min(h, w) * 0.5)
-            x_i = (w - roi_size) // 2
-            y_i = (h - roi_size) // 2
-            roi = img[y_i : y_i + roi_size, x_i : x_i + roi_size]
-
-            now = time.time()
-            self.frame_count += 1
-            elapsed = now - self.start_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.start_time = now
-
-            if roi.size > 0:
-                # Extrai simultaneamente a média dos canais Azul (0) e Vermelho (2)
-                mean_bgr = np.mean(roi, axis=(0, 1))
-                mean_b = float(mean_bgr[0])
-                mean_r = float(mean_bgr[2])
-            else:
-                mean_b, mean_r = 0.0, 0.0
-
-            dedo_ok = mean_r > self.RED_THRESHOLD
-
-            with self.lock:
-                self.dedo_detectado = dedo_ok
-                if dedo_ok:
-                    self.buffer_R.append(mean_r)
-                    self.buffer_B.append(mean_b)
-                    self.timestamps.append(now)
-                    if len(self.buffer_R) > self.buffer_size:
-                        self.buffer_R.pop(0)
-                        self.buffer_B.pop(0)
-                        self.timestamps.pop(0)
-                else:
-                    self.buffer_R.clear()
-                    self.buffer_B.clear()
-                    self.timestamps.clear()
-                    self.estabilizador_bpm.reset()
-                    self.estabilizador_spo2.reset()
-                    self.bpm = 0.0
-                    self.spo2 = 0.0
-
-                bpm_atual = self.bpm
-
-            # Cor do retângulo de feedback: Vermelho (sem dedo), Amarelo (calibrando), Verde (estável)
-            if not dedo_ok:
-                cor_retangulo = (0, 0, 255)
-            elif bpm_atual <= 0:
-                cor_retangulo = (0, 255, 255)
-            else:
-                cor_retangulo = (0, 255, 0)
-
-            cv2.rectangle(img, (x_i, y_i), (x_i + roi_size, y_i + roi_size), cor_retangulo, 3)
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-    video_constraints_dedo = {
-        "video": {
-            "facingMode": {"ideal": "environment"},
-            "width": {"ideal": 640},
-            "height": {"ideal": 480},
-            "frameRate": {"ideal": 30},
-            "advanced": [{"torch": True}],
-        },
-        "audio": False,
-    }
-
-    ctx = webrtc_streamer(
-        key="camera_dedo_ppg",
-        video_processor_factory=ProcessadorDedoPPG,
-        media_stream_constraints=video_constraints_dedo,
-        rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True,
-        desired_playing_state=camera_on,
-    )
-
-    st.subheader("Histórico em Tempo Real")
-    # Instancia o gráfico uma única vez e adiciona linhas com add_rows() para não piscar a tela
-    chart = st.line_chart(pd.DataFrame({"BPM": pd.Series(dtype=float)}))
-
-    if ctx and ctx.state.playing:
-        while ctx.state.playing:
-            vp = ctx.video_processor
-            if vp is None:
-                time.sleep(0.2)
-                continue
-
-            with vp.lock:
-                bpm_val = float(vp.bpm)
-                spo2_val = float(vp.spo2)
-                dedo_ok = bool(vp.dedo_detectado)
-                progresso = min(100, int((len(vp.buffer_R) / vp.min_samples) * 100))
-
-            if not dedo_ok:
-                status_display.warning("👆 **Posicione o dedo** cobrindo a câmera traseira e o flash.")
-            elif bpm_val <= 0:
-                status_display.info(f"⏳ **Estabilizando leitura ({progresso}%)...** mantenha o dedo parado.")
-            else:
-                status_display.success("✅ **Leitura Estabilizada!**")
-
-            if bpm_val > 0:
-                bpm_display.metric(label="Frequência Cardíaca", value=f"{bpm_val:.0f} BPM", delta="❤️")
-                chart.add_rows(pd.DataFrame({"BPM": [round(bpm_val, 1)]}))
-            else:
-                bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
-
-            if spo2_val > 0:
-                spo2_display.metric(label="Oximetria (SpO2)", value=f"{spo2_val:.1f} %", delta="🩸")
-            else:
-                spo2_display.metric(label="Oximetria (SpO2)", value="-- %")
-
-            time.sleep(0.5)
-    else:
-        status_display.info("Aguardando inicialização da câmera traseira...")
-        bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
-        spo2_display.metric(label="Oximetria (SpO2)", value="-- %")
-
+    renderizar_monitor_camera_cloud(modo="dedo")
 
 # ==============================================================================
 # 2. MODO FACIAL / FRONTAL (rPPG: BPM + RPM)
 # ==============================================================================
 elif fonte == "Rosto (Frontal - rPPG)":
-
-    TOGGLE_KEY_FACE = "camera_rosto_on"
-    if TOGGLE_KEY_FACE not in st.session_state:
-        st.session_state[TOGGLE_KEY_FACE] = False
-    camera_face_on = st.toggle("🤳 Ligar/Desligar Câmera Frontal", key=TOGGLE_KEY_FACE)
-
-    st.divider()
-
-    col_status, col_bpm, col_rpm = st.columns([2, 1, 1])
-    with col_status:
-        status_display = st.empty()
-    with col_bpm:
-        bpm_display = st.empty()
-    with col_rpm:
-        rpm_display = st.empty()
-
-    class ProcessadorRostoRPPG(VideoProcessorBase):
-        def __init__(self):
-            # Canal Verde (G) possui maior absorção pela oxi-hemoglobina sob luz ambiente visível
-            self.buffer_G = []
-            self.timestamps = []
-            self.buffer_size = 300       # ~10s a 30 FPS
-            self.min_samples_bpm = 105   # ~3.5s para estabilizar BPM facial
-            self.min_samples_rpm = 160   # ~5.5s para estabilizar RPM
-            self.lock = threading.Lock()
-
-            self.bpm = 0.0
-            self.rpm = 0.0
-            self.estabilizador_bpm = EstabilizadorFisiologico(
-                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=1.2
-            )
-            self.estabilizador_rpm = EstabilizadorFisiologico(
-                janela_mediana=7, alpha=0.15, max_delta_por_ciclo=0.5
-            )
-
-            self.fps = 30.0
-            self.frame_count = 0
-            self.total_frames = 0
-            self.start_time = time.time()
-
-            self.rosto_detectado = False
-            self.last_face_box = None
-            self.frames_sem_rosto = 0
-
-            # Inicializa detector facial Haar Cascade se disponível na build do OpenCV (com fallback YCrCb em Python 3.14+)
-            self.face_cascade = None
-            if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data"):
-                try:
-                    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                    cc = cv2.CascadeClassifier(cascade_path)
-                    if not cc.empty():
-                        self.face_cascade = cc
-                except Exception:
-                    self.face_cascade = None
-
-            self.running = True
-            self.calc_thread = threading.Thread(target=self._loop_calculo_rppg, daemon=True)
-            self.calc_thread.start()
-
-        def _detectar_rosto_fallback_ycrcb(self, small_bgr: np.ndarray):
-            """
-            Detector facial por segmentação de pele no espaço cromático YCrCb (100% NumPy).
-            Atua como fallback automático quando cv2.CascadeClassifier não existe na build (ex: Python 3.14).
-            """
-            sh, sw, _ = small_bgr.shape
-            b = small_bgr[:, :, 0].astype(np.float32)
-            g = small_bgr[:, :, 1].astype(np.float32)
-            r = small_bgr[:, :, 2].astype(np.float32)
-
-            y_luma = 0.299 * r + 0.587 * g + 0.114 * b
-            cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
-            cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
-
-            # Máscara cromática fisiológica de pele humana
-            mask_pele = (y_luma > 40.0) & (cr >= 133.0) & (cr <= 178.0) & (cb >= 77.0) & (cb <= 128.0)
-
-            # Foca na região central para ignorar objetos de fundo nas bordas
-            margem_x = int(sw * 0.12)
-            margem_y = int(sh * 0.08)
-            mask_central = np.zeros_like(mask_pele)
-            mask_central[margem_y : sh - margem_y, margem_x : sw - margem_x] = mask_pele[
-                margem_y : sh - margem_y, margem_x : sw - margem_x
-            ]
-
-            ys, xs = np.where(mask_central)
-            area_minima = int(sw * sh * 0.06)
-            if len(xs) < area_minima:
-                return []
-
-            x1 = int(np.percentile(xs, 5))
-            x2 = int(np.percentile(xs, 95))
-            y1 = int(np.percentile(ys, 5))
-            y2 = int(np.percentile(ys, 95))
-
-            fw = x2 - x1
-            fh = y2 - y1
-            if fw < 35 or fh < 35:
-                return []
-
-            return [(x1, y1, fw, fh)]
-
-        def _loop_calculo_rppg(self):
-            """Thread dedicada à extração de BPM e RPM via rPPG."""
-            fs_uniforme = 30.0
-            while self.running:
-                time.sleep(0.5)
-                with self.lock:
-                    n_amostras = len(self.buffer_G)
-                    if not self.rosto_detectado or n_amostras < self.min_samples_bpm:
-                        continue
-                    arr_g = np.array(self.buffer_G, dtype=np.float64)
-                    arr_t = np.array(self.timestamps, dtype=np.float64)
-
-                try:
-                    g_uniforme = reamostrar_uniforme(arr_t, arr_g, fs_alvo=fs_uniforme)
-                    norm_g = (g_uniforme - np.mean(g_uniforme)) / (np.std(g_uniforme) + 1e-9)
-
-                    # 1. Filtro Cardíaco (BPM): 0.85 Hz a 2.4 Hz (51 a 144 BPM)
-                    filt_cardiaco = bandpass_filter(norm_g, 0.85, 2.4, fs_uniforme, order=3)
-                    peak_bpm_hz = estimar_frequencia_segura(
-                        filt_cardiaco, fs_uniforme, 0.85, 2.4, snr_minimo=1.45, usar_picos_tempo=True
-                    )
-                    bpm_bruto = peak_bpm_hz * 60.0
-
-                    # 2. Filtro Respiratório (RPM): 0.15 Hz a 0.4 Hz (9 a 24 respirações/min)
-                    rpm_bruto = 0.0
-                    if n_amostras >= self.min_samples_rpm:
-                        filt_resp = bandpass_filter(norm_g, 0.15, 0.4, fs_uniforme, order=2)
-                        peak_rpm_hz = estimar_frequencia_segura(
-                            filt_resp, fs_uniforme, 0.15, 0.4, snr_minimo=1.3, usar_picos_tempo=False
-                        )
-                        rpm_bruto = peak_rpm_hz * 60.0
-
-                    with self.lock:
-                        if 50.0 <= bpm_bruto <= 145.0:
-                            self.bpm = self.estabilizador_bpm.atualizar(bpm_bruto)
-                        if 9.0 <= rpm_bruto <= 24.0:
-                            self.rpm = self.estabilizador_rpm.atualizar(rpm_bruto)
-                except Exception as e:
-                    print(f"[Erro DSP rPPG]: {e}")
-                    continue
-
-        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="bgr24")
-            h, w, _ = img.shape
-
-            now = time.time()
-            self.frame_count += 1
-            self.total_frames += 1
-            elapsed = now - self.start_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.start_time = now
-
-            # Detecta o rosto em resolução reduzida (50%) a cada 2 frames para manter 30 FPS cravados
-            if self.total_frames % 2 == 0 or self.last_face_box is None:
-                small_bgr = img[::2, ::2]
-                if self.face_cascade is not None:
-                    small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
-                    faces = self.face_cascade.detectMultiScale(
-                        small_gray,
-                        scaleFactor=1.2,
-                        minNeighbors=5,
-                        minSize=(40, 40),
-                    )
-                else:
-                    faces = self._detectar_rosto_fallback_ycrcb(small_bgr)
-
-                if len(faces) > 0:
-                    mx, my, mw, mh = max(faces, key=lambda r: r[2] * r[3])
-                    novo_box = np.array([mx * 2, my * 2, mw * 2, mh * 2], dtype=np.float64)
-                    if self.last_face_box is None:
-                        self.last_face_box = novo_box
-                    else:
-                        # Suaviza a posição da bounding box para que a ROI da testa não trepide
-                        self.last_face_box = 0.25 * novo_box + 0.75 * self.last_face_box
-                    self.frames_sem_rosto = 0
-                else:
-                    self.frames_sem_rosto += 1
-                    if self.frames_sem_rosto > 10:
-                        self.last_face_box = None
-
-            if self.last_face_box is not None:
-                fx, fy, fw, fh = self.last_face_box.astype(int)
-
-                # Isola a ROI da Testa (x + 0.3w, y + 0.1h, largura 0.4w, altura 0.2h)
-                tx = max(0, int(fx + 0.3 * fw))
-                ty = max(0, int(fy + 0.1 * fh))
-                tw = int(0.4 * fw)
-                th = int(0.2 * fh)
-
-                tx_end = min(w, tx + tw)
-                ty_end = min(h, ty + th)
-
-                roi_testa = img[ty:ty_end, tx:tx_end]
-
-                if roi_testa.size > 0:
-                    # Extrai a média espacial do canal Verde (índice 1 no formato BGR)
-                    mean_g = float(np.mean(roi_testa[:, :, 1]))
-
-                    with self.lock:
-                        self.rosto_detectado = True
-                        self.buffer_G.append(mean_g)
-                        self.timestamps.append(now)
-                        if len(self.buffer_G) > self.buffer_size:
-                            self.buffer_G.pop(0)
-                            self.timestamps.pop(0)
-                        bpm_atual = self.bpm
-                else:
-                    bpm_atual = 0.0
-
-                cor_testa = (0, 255, 0) if bpm_atual > 0 else (0, 255, 255)
-                cv2.rectangle(img, (fx, fy), (fx + fw, fy + fh), (255, 200, 0), 2)
-                cv2.rectangle(img, (tx, ty), (tx_end, ty_end), cor_testa, 2)
-            else:
-                with self.lock:
-                    self.rosto_detectado = False
-                    self.buffer_G.clear()
-                    self.timestamps.clear()
-                    self.estabilizador_bpm.reset()
-                    self.estabilizador_rpm.reset()
-                    self.bpm = 0.0
-                    self.rpm = 0.0
-
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-    video_constraints_rosto = {
-        "video": {
-            "facingMode": {"ideal": "user"},
-            "width": {"ideal": 640},
-            "height": {"ideal": 480},
-            "frameRate": {"ideal": 30},
-            "torch": False,
-        },
-        "audio": False,
-    }
-
-    ctx_face = webrtc_streamer(
-        key="camera_rosto_rppg",
-        video_processor_factory=ProcessadorRostoRPPG,
-        media_stream_constraints=video_constraints_rosto,
-        rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True,
-        desired_playing_state=camera_face_on,
-    )
-
-    st.subheader("Histórico em Tempo Real")
-    chart_face = st.line_chart(pd.DataFrame({"BPM": pd.Series(dtype=float)}))
-
-    if ctx_face and ctx_face.state.playing:
-        while ctx_face.state.playing:
-            vp = ctx_face.video_processor
-            if vp is None:
-                time.sleep(0.2)
-                continue
-
-            with vp.lock:
-                bpm_val = float(vp.bpm)
-                rpm_val = float(vp.rpm)
-                rosto_ok = bool(vp.rosto_detectado)
-                progresso = min(100, int((len(vp.buffer_G) / vp.min_samples_bpm) * 100))
-
-            if not rosto_ok:
-                status_display.warning("🙂 **Posicione seu rosto** de frente para a câmera em local iluminado.")
-            elif bpm_val <= 0:
-                status_display.info(f"⏳ **Estabilizando rPPG da testa ({progresso}%)...** evite movimentos.")
-            else:
-                status_display.success("✅ **Leitura rPPG Estabilizada!**")
-
-            if bpm_val > 0:
-                bpm_display.metric(label="Frequência Cardíaca", value=f"{bpm_val:.0f} BPM", delta="❤️")
-                chart_face.add_rows(pd.DataFrame({"BPM": [round(bpm_val, 1)]}))
-            else:
-                bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
-
-            if rpm_val > 0:
-                rpm_display.metric(label="Freq. Respiratória", value=f"{rpm_val:.0f} RPM", delta="🫁")
-            else:
-                rpm_display.metric(label="Freq. Respiratória", value="-- RPM")
-
-            time.sleep(0.5)
-    else:
-        status_display.info("Aguardando inicialização da câmera frontal...")
-        bpm_display.metric(label="Frequência Cardíaca", value="-- BPM")
-        rpm_display.metric(label="Freq. Respiratória", value="-- RPM")
-
+    renderizar_monitor_camera_cloud(modo="rosto")
 
 # ==============================================================================
-# 3. MODO VÍDEO (Upload)
+# 3. MODO VÍDEO (Upload Offline processado via SciPy/OpenCV)
 # ==============================================================================
 else:
     st.info("Envie um vídeo curto (ex.: .mp4) para extrair BPM e SpO2 offline.")
@@ -883,7 +1092,7 @@ else:
                 break
 
             if i % 3 == 0:
-                small = cv2.resize(frame, (320, 240))
+                small = frame[::2, ::2]
                 frame_preview.image(cv2.cvtColor(small, cv2.COLOR_BGR2RGB), caption=f"Frame {i + 1}")
 
             h, w, _ = frame.shape
