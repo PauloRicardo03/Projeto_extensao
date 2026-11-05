@@ -601,13 +601,62 @@ elif fonte == "Rosto (Frontal - rPPG)":
             self.last_face_box = None
             self.frames_sem_rosto = 0
 
-            # Detector facial Haar Cascade nativo do OpenCV (leve e sem dependências externas pesadas)
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            # Inicializa detector facial Haar Cascade se disponível na build do OpenCV (com fallback YCrCb em Python 3.14+)
+            self.face_cascade = None
+            if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data"):
+                try:
+                    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                    cc = cv2.CascadeClassifier(cascade_path)
+                    if not cc.empty():
+                        self.face_cascade = cc
+                except Exception:
+                    self.face_cascade = None
 
             self.running = True
             self.calc_thread = threading.Thread(target=self._loop_calculo_rppg, daemon=True)
             self.calc_thread.start()
+
+        def _detectar_rosto_fallback_ycrcb(self, small_bgr: np.ndarray):
+            """
+            Detector facial por segmentação de pele no espaço cromático YCrCb (100% NumPy).
+            Atua como fallback automático quando cv2.CascadeClassifier não existe na build (ex: Python 3.14).
+            """
+            sh, sw, _ = small_bgr.shape
+            b = small_bgr[:, :, 0].astype(np.float32)
+            g = small_bgr[:, :, 1].astype(np.float32)
+            r = small_bgr[:, :, 2].astype(np.float32)
+
+            y_luma = 0.299 * r + 0.587 * g + 0.114 * b
+            cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
+            cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
+
+            # Máscara cromática fisiológica de pele humana
+            mask_pele = (y_luma > 40.0) & (cr >= 133.0) & (cr <= 178.0) & (cb >= 77.0) & (cb <= 128.0)
+
+            # Foca na região central para ignorar objetos de fundo nas bordas
+            margem_x = int(sw * 0.12)
+            margem_y = int(sh * 0.08)
+            mask_central = np.zeros_like(mask_pele)
+            mask_central[margem_y : sh - margem_y, margem_x : sw - margem_x] = mask_pele[
+                margem_y : sh - margem_y, margem_x : sw - margem_x
+            ]
+
+            ys, xs = np.where(mask_central)
+            area_minima = int(sw * sh * 0.06)
+            if len(xs) < area_minima:
+                return []
+
+            x1 = int(np.percentile(xs, 5))
+            x2 = int(np.percentile(xs, 95))
+            y1 = int(np.percentile(ys, 5))
+            y2 = int(np.percentile(ys, 95))
+
+            fw = x2 - x1
+            fh = y2 - y1
+            if fw < 35 or fh < 35:
+                return []
+
+            return [(x1, y1, fw, fh)]
 
         def _loop_calculo_rppg(self):
             """Thread dedicada à extração de BPM e RPM via rPPG."""
@@ -665,15 +714,17 @@ elif fonte == "Rosto (Frontal - rPPG)":
 
             # Detecta o rosto em resolução reduzida (50%) a cada 2 frames para manter 30 FPS cravados
             if self.total_frames % 2 == 0 or self.last_face_box is None:
-                small_gray = cv2.cvtColor(
-                    cv2.resize(img, (w // 2, h // 2)), cv2.COLOR_BGR2GRAY
-                )
-                faces = self.face_cascade.detectMultiScale(
-                    small_gray,
-                    scaleFactor=1.2,
-                    minNeighbors=5,
-                    minSize=(40, 40),
-                )
+                small_bgr = img[::2, ::2]
+                if self.face_cascade is not None:
+                    small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+                    faces = self.face_cascade.detectMultiScale(
+                        small_gray,
+                        scaleFactor=1.2,
+                        minNeighbors=5,
+                        minSize=(40, 40),
+                    )
+                else:
+                    faces = self._detectar_rosto_fallback_ycrcb(small_bgr)
 
                 if len(faces) > 0:
                     mx, my, mw, mh = max(faces, key=lambda r: r[2] * r[3])
