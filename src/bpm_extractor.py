@@ -1015,12 +1015,24 @@ def renderizar_monitor_camera_cloud(modo: str):
           console.warn("Aviso ao definir allow no frameElement:", e);
         }}
 
+        const navPrincipal = (
+          window.parent &&
+          window.parent.navigator &&
+          window.parent.navigator.mediaDevices
+        )
+          ? window.parent.navigator
+          : navigator;
+
         const btnTorch = document.getElementById("btnTorch");
         let torchAtiva = false;
 
         async function setTorch(track, estado) {{
           if (!track || !track.applyConstraints) return false;
           try {{
+            const caps = track.getCapabilities ? track.getCapabilities() : {{}};
+            if (!caps.torch) {{
+              return false;
+            }}
             await track.applyConstraints({{ advanced: [{{ torch: estado }}] }});
             torchAtiva = estado;
             if (btnTorch) {{
@@ -1035,52 +1047,56 @@ def renderizar_monitor_camera_cloud(modo: str):
         }}
 
         async function tentarAtivarTorch(currentStream) {{
-          const track = currentStream.getVideoTracks()[0];
+          let track = currentStream.getVideoTracks()[0];
           if (!track) return false;
 
-          // 1. Tentativa imediata
+          // Aguarda 300ms para o hardware da câmera estabilizar após o play()
+          await new Promise(r => setTimeout(r, 300));
+
+          // 1. Verifica se a lente traseira atual possui flash (caps.torch)
           let ok = await setTorch(track, true);
           if (ok) return true;
 
-          // 2. Retry após 350ms (permite que o driver de exposição e foco da câmera termine de inicializar)
+          // 2. Retry após mais 350ms
           await new Promise(r => setTimeout(r, 350));
           ok = await setTorch(track, true);
           if (ok) return true;
 
-          // 3. Se a câmera atual não tem capacidade de flash (ex: sensor ultra-wide selecionado por padrão),
-          // enumera os dispositivos de vídeo traseiros para selecionar o sensor principal com flash
+          // 3. Em celulares com múltiplas lentes traseiras, a lente padrão pode ser a ultra-wide (sem flash).
+          // Enumera todas as câmeras e testa as traseiras até achar a lente principal que tem caps.torch = true.
           try {{
-            const navPrincipal = (
-              window.parent &&
-              window.parent.navigator &&
-              window.parent.navigator.mediaDevices
-            )
-              ? window.parent.navigator
-              : navigator;
-
             if (navPrincipal.mediaDevices.enumerateDevices) {{
               const devices = await navPrincipal.mediaDevices.enumerateDevices();
               const videoInputs = devices.filter(d => d.kind === "videoinput");
-              const currentId = track.getSettings().deviceId;
+              const currentId = track.getSettings ? track.getSettings().deviceId : "";
 
-              for (const dev of videoInputs) {{
-                if (dev.deviceId === currentId) continue;
+              // Prioriza câmeras cujo label indique traseira/back/environment/0
+              const candidatos = videoInputs.filter(d => d.deviceId !== currentId);
+
+              for (const dev of candidatos) {{
+                const label = (dev.label || "").toLowerCase();
+                if (label.includes("front") || label.includes("user") || label.includes("frontal")) {{
+                  continue;
+                }}
                 try {{
                   const s = await navPrincipal.mediaDevices.getUserMedia({{
                     audio: false,
                     video: {{
                       deviceId: {{ exact: dev.deviceId }},
-                      advanced: [{{ torch: true }}]
+                      width: {{ ideal: 640 }},
+                      height: {{ ideal: 480 }}
                     }}
                   }});
                   const t = s.getVideoTracks()[0];
                   if (t) {{
+                    await new Promise(r => setTimeout(r, 250));
                     const caps = t.getCapabilities ? t.getCapabilities() : {{}};
                     if (caps.torch) {{
                       track.stop();
                       stream = s;
                       videoEl.srcObject = s;
                       await videoEl.play();
+                      await new Promise(r => setTimeout(r, 250));
                       await setTorch(t, true);
                       return true;
                     }} else {{
@@ -1098,15 +1114,6 @@ def renderizar_monitor_camera_cloud(modo: str):
         }}
 
         async function obterStreamCamera(modo) {{
-          // Usa o mediaDevices da janela principal do Streamlit (que possui permissão allow="camera" no Streamlit Cloud)
-          const navPrincipal = (
-            window.parent &&
-            window.parent.navigator &&
-            window.parent.navigator.mediaDevices
-          )
-            ? window.parent.navigator
-            : navigator;
-
           if (!navPrincipal.mediaDevices || !navPrincipal.mediaDevices.getUserMedia) {{
             throw new Error("API de câmera (mediaDevices) indisponível neste navegador.");
           }}
@@ -1115,22 +1122,13 @@ def renderizar_monitor_camera_cloud(modo: str):
           const tentativas = [];
 
           if (modo === "dedo") {{
-            // No modo dedo, tenta solicitar a lanterna (torch) já na inicialização do stream
             tentativas.push({{
               audio: false,
               video: {{
-                facingMode: {{ ideal: "environment" }},
+                facingMode: {{ exact: "environment" }},
                 width: {{ ideal: 640 }},
                 height: {{ ideal: 480 }},
-                frameRate: {{ ideal: 30 }},
-                advanced: [{{ torch: true }}]
-              }}
-            }});
-            tentativas.push({{
-              audio: false,
-              video: {{
-                facingMode: {{ ideal: "environment" }},
-                advanced: [{{ torch: true }}]
+                frameRate: {{ ideal: 30 }}
               }}
             }});
           }}
@@ -1193,32 +1191,6 @@ def renderizar_monitor_camera_cloud(modo: str):
             videoEl.srcObject = stream;
             await videoEl.play();
 
-            // Ativa a lanterna (torch) se estiver no modo Dedo
-            if (MODO === "dedo") {{
-              const suportaTorch = (
-                navPrincipal.mediaDevices.getSupportedConstraints &&
-                navPrincipal.mediaDevices.getSupportedConstraints().torch
-              );
-
-              if (btnTorch) {{
-                btnTorch.style.display = "inline-flex";
-                btnTorch.textContent = "🔦 Ligar Flash";
-                btnTorch.style.background = "#4C566A";
-              }}
-
-              if (!suportaTorch) {{
-                statusBox.className = "status-box warn";
-                statusBox.innerHTML = "⚠️ <b>Aviso:</b> O Firefox Mobile não suporta a API de lanterna. Abra este link no <b>Google Chrome</b> para o flash acender automaticamente!";
-              }} else {{
-                const ativou = await tentarAtivarTorch(stream);
-                if (!ativou) {{
-                  console.warn("Lanterna não ativada automaticamente. Use o botão 🔦 Ligar Flash.");
-                }}
-              }}
-            }} else {{
-              if (btnTorch) btnTorch.style.display = "none";
-            }}
-
             isRunning = true;
             btnToggle.textContent = "⏹️ Desligar Câmera";
             btnToggle.classList.add("active");
@@ -1227,6 +1199,22 @@ def renderizar_monitor_camera_cloud(modo: str):
 
             animId = requestAnimationFrame(renderLoop);
             calcTimer = setInterval(executarCicloDSP, 500);
+
+            // Ativa a lanterna (torch) se estiver no modo Dedo
+            if (MODO === "dedo") {{
+              if (btnTorch) {{
+                btnTorch.style.display = "inline-flex";
+                btnTorch.textContent = "🔦 Ligar Flash";
+                btnTorch.style.background = "#4C566A";
+              }}
+              tentarAtivarTorch(stream).then((ativou) => {{
+                if (!ativou) {{
+                  console.warn("Lanterna não ativada automaticamente. Use o botão 🔦 Ligar Flash ou abra no Chrome.");
+                }}
+              }});
+            }} else {{
+              if (btnTorch) btnTorch.style.display = "none";
+            }}
           }} catch (err) {{
             statusBox.className = "status-box warn";
             statusBox.innerHTML = `❌ <b>Erro ao acessar câmera:</b> ${{err.message || err}}. Verifique a permissão do navegador.`;
@@ -1241,7 +1229,10 @@ def renderizar_monitor_camera_cloud(modo: str):
             const novoEstado = !torchAtiva;
             const ok = await setTorch(track, novoEstado);
             if (!ok) {{
-              alert("Não foi possível acionar a lanterna por este navegador. Dica: no Android, o Google Chrome oferece suporte completo nativo ao hardware de flash.");
+              const okBusca = await tentarAtivarTorch(stream);
+              if (!okBusca) {{
+                alert("Este navegador não suporta controle da lanterna (o Firefox Android não possui suporte à API de flash). Abra este mesmo link no Google Chrome para usar o flash!");
+              }}
             }}
           }});
         }}
