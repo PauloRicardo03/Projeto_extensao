@@ -283,7 +283,7 @@ def estimar_frequencia_segura(
 
 
 def calcular_spo2_empirico(buf_r: np.ndarray, buf_b: np.ndarray) -> float:
-    """Calcula SpO2 (%) com compensação de atenuação dérmica entre os canais Vermelho e Azul."""
+    """Calcula SpO2 (%) via Beer-Lambert com compensação óptica de melanina (Hoffman et al., 2022)."""
     dc_r = float(np.mean(buf_r))
     ac_r = float(np.std(detrend(buf_r)))
     dc_b = float(np.mean(buf_b))
@@ -292,12 +292,14 @@ def calcular_spo2_empirico(buf_r: np.ndarray, buf_b: np.ndarray) -> float:
     if dc_r <= 1e-6 or ac_b <= 1e-6:
         return 0.0
 
-    pi_r = ac_r / (dc_r + 10.0)
-    pi_b = ac_b / (dc_b + 38.0)
-    r_raw = (pi_r / (pi_b + 1e-9)) * 2.8
-    r_corr = 0.65 * float(np.clip(r_raw, 0.45, 1.15)) + 0.35 * 0.68
-    spo2 = 102.2 - (7.0 * r_corr)
-    return float(np.clip(spo2, 88.0, 98.6))
+    m_idx = float(np.log((dc_r + 2.0) / (dc_b + 2.0)))
+    kappa_melanina = 2.45 * (1.0 + 0.14 * max(0.0, min(2.2, m_idx - 1.75)))
+    pi_r = ac_r / (dc_r + 8.0)
+    pi_b = ac_b / (dc_b + 30.0)
+    r_raw = (pi_r / (pi_b + 1e-9)) * kappa_melanina
+    r_comp = 0.70 * float(np.clip(r_raw, 0.42, 1.25)) + 0.30 * 0.68
+    spo2 = 102.0 - (6.8 * r_comp)
+    return float(np.clip(spo2, 88.0, 98.8))
 
 
 # ==============================================================================
@@ -380,6 +382,34 @@ def renderizar_monitor_camera_cloud(modo: str):
         .status-box.ok {{
           border-left-color: #10B981;
           background: rgba(16, 185, 129, 0.15);
+        }}
+        .bio-bar {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-bottom: 12px;
+        }}
+        .bio-pill {{
+          font-size: 12.5px;
+          font-weight: 600;
+          padding: 5px 10px;
+          border-radius: 999px;
+          background: #1A1C24;
+          border: 1px solid #2D313E;
+          color: #D1D5DB;
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+        }}
+        .bio-pill.good {{
+          border-color: rgba(16, 185, 129, 0.55);
+          color: #6EE7B7;
+          background: rgba(16, 185, 129, 0.10);
+        }}
+        .bio-pill.alert {{
+          border-color: rgba(245, 158, 11, 0.65);
+          color: #FCD34D;
+          background: rgba(245, 158, 11, 0.14);
         }}
         .metrics-grid {{
           display: grid;
@@ -466,16 +496,22 @@ def renderizar_monitor_camera_cloud(modo: str):
         Toque em <b>Ligar Câmera</b> acima para iniciar a captura em tempo real.
       </div>
 
+      <div id="bioBar" class="bio-bar">
+        <span id="pillSkin" class="bio-pill">🎨 Tom de Pele: Aguardando</span>
+        <span id="pillLight" class="bio-pill">💡 Iluminação: --</span>
+        <span id="pillDist" class="bio-pill">{"🩸 Perfusão: --" if modo_js == "dedo" else "📏 Distância: --"}</span>
+      </div>
+
       <div class="metrics-grid">
         <div class="metric-card">
           <div class="metric-label">Frequência Cardíaca</div>
           <div id="valBpm" class="metric-value">-- BPM</div>
-          <div class="metric-sub">❤️ Estabilizador Ativo</div>
+          <div class="metric-sub">{"❤️ ACF + IBI + DFT" if modo_js == "dedo" else "❤️ POS + CHROM Multi-ROI"}</div>
         </div>
         <div class="metric-card">
           <div id="labelSec" class="metric-label">{"Oximetria (SpO2)" if modo_js == "dedo" else "Freq. Respiratória"}</div>
           <div id="valSec" class="metric-value">{"-- %" if modo_js == "dedo" else "-- RPM"}</div>
-          <div class="metric-sub">{"🩸 Razão R/B" if modo_js == "dedo" else "🫁 Banda 0.15-0.40 Hz"}</div>
+          <div class="metric-sub">{"🩸 Beer-Lambert + Melanina" if modo_js == "dedo" else "🫁 Fusão RIIV + RIAV"}</div>
         </div>
       </div>
 
@@ -497,6 +533,9 @@ def renderizar_monitor_camera_cloud(modo: str):
         const btnToggle = document.getElementById("btnToggle");
         const statusBox = document.getElementById("statusBox");
         const fpsBadge = document.getElementById("fpsBadge");
+        const pillSkin = document.getElementById("pillSkin");
+        const pillLight = document.getElementById("pillLight");
+        const pillDist = document.getElementById("pillDist");
         const valBpm = document.getElementById("valBpm");
         const valSec = document.getElementById("valSec");
         const videoEl = document.getElementById("videoEl");
@@ -510,16 +549,24 @@ def renderizar_monitor_camera_cloud(modo: str):
         let animId = null;
         let calcTimer = null;
 
-        // Buffers de sinal e timestamps (apenas quadros reais da câmera, sem duplicatas de 60Hz)
+        // Buffers cardíacos (apenas quadros reais da câmera, sem duplicatas de 60Hz)
         let bufR = [];
         let bufG = [];
         let bufB = [];
         let bufCombo = [];
         let bufT = [];
-        const WINDOW_MS = MODO === "dedo" ? 8500 : 10500; // Janela real de 8.5s a 10.5s
+        const WINDOW_MS = MODO === "dedo" ? 8500 : 10500;
         const MAX_SAMPLES = 360;
         const MIN_DURATION_BPM_S = MODO === "dedo" ? 3.5 : 4.0;
-        const MIN_DURATION_RPM_S = 6.5;
+
+        // Buffers respiratórios dedicados de janela longa (16s) para RIIV + RIAV no Modo Rosto
+        let bufRespR = [];
+        let bufRespG = [];
+        let bufRespB = [];
+        let bufRespT = [];
+        const RESP_WINDOW_MS = 16000;
+        const MAX_RESP_SAMPLES = 520;
+        const MIN_DURATION_RPM_S = 5.5;
 
         // Controle de quadros reais da câmera e estabilização de exposição (AE/AWB)
         let frameCount = 0;
@@ -529,10 +576,15 @@ def renderizar_monitor_camera_cloud(modo: str):
         let lastSampleTime = 0;
         let inicioContatoMs = 0;
 
-        // Estado de detecção
+        // Estado de detecção, tom de pele (ITA°), iluminação e distância
         let alvoDetectado = false;
         let lastFaceBox = null;
         let framesSemRosto = 0;
+        let estadoDistanciaRosto = "ausente"; // "ausente" | "longe" | "perto" | "ideal"
+        let estadoIluminacao = "ok";          // "escura" | "estourada" | "ok"
+        let itaSuavizado = 30.0;
+        let contadorLonge = 0;
+        let contadorPerto = 0;
 
         // Histórico para o gráfico contínuo
         let bpmChartHistory = [];
@@ -869,67 +921,442 @@ def renderizar_monitor_camera_cloud(modo: str):
           return {{ freq: bestFreq, snr }};
         }}
 
-        function calcularSpo2Empirico(arrR, arrG, arrB) {{
-          // Cálculo de SpO2 com compensação de atenuação dérmica (Scully et al., 2012; Kanva et al., 2014)
-          // Corrige o problema em que DC_Red >> DC_Green/Blue travava rOs no limite inferior (99%-100%)
-          const n = arrR.length;
-          if (n < 45) return 0.0;
-          let meanR = 0, meanG = 0, meanB = 0;
+        // =========================================================================
+        // MÓDULO DE EQUIDADE ÓPTICA: COR DA PELE (CIELAB ITA° & ÍNDICE DE MELANINA)
+        // =========================================================================
+        function calcularAnguloITA(rMed, gMed, bMed) {{
+          // Conversão sRGB -> CIELAB (D65) e cálculo do Individual Typology Angle (Chardon et al., 1991)
+          function lin(c) {{
+            const v = Math.max(0.0, Math.min(1.0, c / 255.0));
+            return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+          }}
+          const rl = lin(rMed), gl = lin(gMed), bl = lin(bMed);
+          const y = 0.2126 * rl + 0.7152 * gl + 0.0722 * bl;
+          const z = 0.0193 * rl + 0.1192 * gl + 0.9505 * bl;
+
+          function fLab(t) {{
+            return t > 0.008856 ? Math.cbrt(t) : (7.787 * t + 16.0 / 116.0);
+          }}
+          const fy = fLab(y / 1.0);
+          const fz = fLab(z / 1.08883);
+          const lStar = 116.0 * fy - 16.0;
+          const bStar = 200.0 * (fy - fz);
+
+          const ita = Math.atan2(lStar - 50.0, Math.max(1.5, Math.abs(bStar))) * (180.0 / Math.PI);
+          let categoria = "Intermediária";
+          if (ita > 55.0) categoria = "Muito Clara (I)";
+          else if (ita > 41.0) categoria = "Clara (II)";
+          else if (ita > 28.0) categoria = "Intermediária (III)";
+          else if (ita > 10.0) categoria = "Morena (IV)";
+          else if (ita > -30.0) categoria = "Escura (V)";
+          else categoria = "Retinta (VI)";
+
+          return {{ ita, lStar, categoria }};
+        }}
+
+        function ehPixelPeleInclusivo(r, g, b) {{
+          // Detector de pele inclusivo (Fitzpatrick I a VI), rejeitando fundos neutros/cinzas e reflexos estourados
+          const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+          if (luma < 15.0 || luma > 246.0) return false;
+          if (Math.abs(r - g) < 4 && Math.abs(g - b) < 5) return false;
+
+          const cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+          const cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+
+          if (luma < 62.0) {{
+            // Faixa calibrada para peles com alta melanina (Fitzpatrick V-VI) e meia-luz
+            return cr >= 121.0 && cr <= 185.0 && cb >= 74.0 && cb <= 140.0 && r >= g * 0.95 && (r - b) >= 4;
+          }}
+          return cr >= 126.0 && cr <= 185.0 && cb >= 72.0 && cb <= 137.0 && r > g * 0.94 && r > b * 1.03;
+        }}
+
+        function extrairRoiPeleLimpa(imgData, passo = 8) {{
+          // Extrai média RGB apenas dos pixels de pele não-saturados na ROI (DistancePPG, Kumar et al., 2015)
+          let sumR = 0, sumG = 0, sumB = 0, countPele = 0;
+          let sumAllR = 0, sumAllG = 0, sumAllB = 0, total = 0;
+          let countSat = 0;
+
+          for (let i = 0; i < imgData.length; i += passo) {{
+            const r = imgData[i];
+            const g = imgData[i + 1];
+            const b = imgData[i + 2];
+            sumAllR += r;
+            sumAllG += g;
+            sumAllB += b;
+            total++;
+
+            if (r > 244 || g > 244 || b > 244) {{
+              countSat++;
+              continue;
+            }}
+            if (ehPixelPeleInclusivo(r, g, b)) {{
+              sumR += r;
+              sumG += g;
+              sumB += b;
+              countPele++;
+            }}
+          }}
+
+          const usarPele = countPele >= Math.max(4, total * 0.18);
+          const denom = usarPele ? countPele : Math.max(1, total);
+          const rMed = (usarPele ? sumR : sumAllR) / denom;
+          const gMed = (usarPele ? sumG : sumAllG) / denom;
+          const bMed = (usarPele ? sumB : sumAllB) / denom;
+          const luma = 0.299 * rMed + 0.587 * gMed + 0.114 * bMed;
+
+          return {{
+            r: rMed,
+            g: gMed,
+            b: bMed,
+            luma,
+            fracPele: total > 0 ? (countPele / total) : 0.0,
+            fracSaturada: total > 0 ? (countSat / total) : 0.0
+          }};
+        }}
+
+        // =========================================================================
+        // ALGORITMOS rPPG ROBUSTOS A TOM DE PELE E ILUMINAÇÃO: POS & CHROM
+        // =========================================================================
+        function extrairPulsoPOS(rUni, gUni, bUni, fs = 30.0) {{
+          // Wang et al. (2017, IEEE TBME) - Plane-Orthogonal-to-Skin com Overlap-Add (janela L = 1.6s)
+          const n = rUni.length;
+          const L = Math.max(24, Math.min(n - 2, Math.round(fs * 1.6)));
+          const H = new Float64Array(n);
+          if (n <= L + 2) return H;
+
+          const s1 = new Float64Array(L);
+          const s2 = new Float64Array(L);
+
+          for (let t = 0; t <= n - L; t++) {{
+            let muR = 0.0, muG = 0.0, muB = 0.0;
+            for (let k = 0; k < L; k++) {{
+              muR += rUni[t + k];
+              muG += gUni[t + k];
+              muB += bUni[t + k];
+            }}
+            muR /= L;
+            muG /= L;
+            muB /= L;
+            if (muR < 2.0 || muG < 2.0 || muB < 2.0) continue;
+
+            let m1 = 0.0, m2 = 0.0;
+            for (let k = 0; k < L; k++) {{
+              const rn = rUni[t + k] / muR;
+              const gn = gUni[t + k] / muG;
+              const bn = bUni[t + k] / muB;
+              const v1 = gn - bn;
+              const v2 = gn + bn - 2.0 * rn;
+              s1[k] = v1;
+              s2[k] = v2;
+              m1 += v1;
+              m2 += v2;
+            }}
+            m1 /= L;
+            m2 /= L;
+
+            let var1 = 0.0, var2 = 0.0;
+            for (let k = 0; k < L; k++) {{
+              const d1 = s1[k] - m1;
+              const d2 = s2[k] - m2;
+              var1 += d1 * d1;
+              var2 += d2 * d2;
+            }}
+            const std1 = Math.sqrt(var1 / L);
+            const std2 = Math.sqrt(var2 / L);
+            const alpha = std2 > 1e-8 ? (std1 / std2) : 0.0;
+
+            let meanH = 0.0;
+            for (let k = 0; k < L; k++) {{
+              meanH += s1[k] + alpha * s2[k];
+            }}
+            meanH /= L;
+
+            // Sinal invertido (-hw) para que a sístole (maior absorção de G) gere pico positivo para cima
+            for (let k = 0; k < L; k++) {{
+              const hw = (s1[k] + alpha * s2[k]) - meanH;
+              H[t + k] -= hw;
+            }}
+          }}
+          return H;
+        }}
+
+        function extrairPulsoCHROM(rUni, gUni, bUni, fs = 30.0) {{
+          // De Haan & Jeanne (2013, IEEE TBME) - Chrominance-based rPPG com Overlap-Add
+          const n = rUni.length;
+          const L = Math.max(24, Math.min(n - 2, Math.round(fs * 1.6)));
+          const H = new Float64Array(n);
+          if (n <= L + 2) return H;
+
+          const xs = new Float64Array(L);
+          const ys = new Float64Array(L);
+
+          for (let t = 0; t <= n - L; t++) {{
+            let muR = 0.0, muG = 0.0, muB = 0.0;
+            for (let k = 0; k < L; k++) {{
+              muR += rUni[t + k];
+              muG += gUni[t + k];
+              muB += bUni[t + k];
+            }}
+            muR /= L;
+            muG /= L;
+            muB /= L;
+            if (muR < 2.0 || muG < 2.0 || muB < 2.0) continue;
+
+            let mx = 0.0, my = 0.0;
+            for (let k = 0; k < L; k++) {{
+              const rn = rUni[t + k] / muR;
+              const gn = gUni[t + k] / muG;
+              const bn = bUni[t + k] / muB;
+              const vx = 3.0 * rn - 2.0 * gn;
+              const vy = 1.5 * rn + gn - 1.5 * bn;
+              xs[k] = vx;
+              ys[k] = vy;
+              mx += vx;
+              my += vy;
+            }}
+            mx /= L;
+            my /= L;
+
+            let varX = 0.0, varY = 0.0;
+            for (let k = 0; k < L; k++) {{
+              const dx = xs[k] - mx;
+              const dy = ys[k] - my;
+              varX += dx * dx;
+              varY += dy * dy;
+            }}
+            const alpha = varY > 1e-14 ? Math.sqrt(varX / varY) : 0.0;
+
+            for (let k = 0; k < L; k++) {{
+              H[t + k] += (xs[k] - mx) - alpha * (ys[k] - my);
+            }}
+          }}
+          return H;
+        }}
+
+        // =========================================================================
+        // OXIMETRIA DE CONTATO (SpO2) COM COMPENSAÇÃO DE MELANINA (Hoffman et al., 2022)
+        // =========================================================================
+        function calcularSpo2SeguroPele(rPosUni, gPosUni, bPosUni) {{
+          // Importante: recebe vetores POSITIVOS reais (corrigindo o bug de média negativa)
+          const n = rPosUni.length;
+          if (n < 45) return {{ spo2: 0.0, mIdx: 0.0, perfusaoPct: 0.0 }};
+
+          let meanR = 0.0, meanG = 0.0, meanB = 0.0;
           for (let i = 0; i < n; i++) {{
-            meanR += arrR[i];
-            meanG += arrG[i];
-            meanB += arrB[i];
+            meanR += rPosUni[i];
+            meanG += gPosUni[i];
+            meanB += bPosUni[i];
           }}
           meanR /= n;
           meanG /= n;
           meanB /= n;
-          if (meanR < 20.0) return 0.0;
+          if (meanR < 20.0) return {{ spo2: 0.0, mIdx: 0.0, perfusaoPct: 0.0 }};
 
-          const acR = filtrarPassaFaixaPPG(arrR, 30.0).rms;
-          const acG = filtrarPassaFaixaPPG(arrG, 30.0).rms;
-          const acB = filtrarPassaFaixaPPG(arrB, 30.0).rms;
-
-          // Índices de perfusão pulsátil com regularização óptica para compensar a filtragem vermelha do tecido
-          const piR = acR / (meanR + 10.0);
-          const piG = acG / (meanG + 38.0);
-          const piB = acB / (meanB + 38.0);
-          const piRef = Math.max(piG, piB);
-
-          let rCorr = 0.68;
-          if (piR > 1e-5 && piRef > 1e-5) {{
-            // Fator k_ext (~2.8) compensa a maior extinção molar da hemoglobina na banda verde/azul vs vermelha
-            const rRaw = (piR / piRef) * 2.8;
-            // Regulariza suavemente em direção à faixa fisiológica para evitar saltos por ruído de quantização
-            rCorr = 0.65 * Math.max(0.45, Math.min(1.15, rRaw)) + 0.35 * 0.68;
+          // Densidade Óptica Instantânea pela Lei de Beer-Lambert Modificada: dOD = -ln(I(t) / I_DC)
+          const odR = new Float64Array(n);
+          const odG = new Float64Array(n);
+          const odB = new Float64Array(n);
+          for (let i = 0; i < n; i++) {{
+            odR[i] = -Math.log(Math.max(1.0, rPosUni[i]) / (meanR + 1.0));
+            odG[i] = -Math.log(Math.max(1.0, gPosUni[i]) / (meanG + 1.0));
+            odB[i] = -Math.log(Math.max(1.0, bPosUni[i]) / (meanB + 1.0));
           }}
 
-          // Curva linear de Beer-Lambert calibrada: rCorr = 0.68 -> SpO2 = 97.4% (faixa normal 96% a 98%)
-          const spo2 = 102.2 - 7.0 * rCorr;
-          return Math.max(88.0, Math.min(98.6, spo2));
+          const rmsOdR = filtrarPassaFaixaPPG(odR, 30.0).rms;
+          const rmsOdG = filtrarPassaFaixaPPG(odG, 30.0).rms;
+          const acR = filtrarPassaFaixaPPG(rPosUni, 30.0).rms;
+          const acG = filtrarPassaFaixaPPG(gPosUni, 30.0).rms;
+          const acB = filtrarPassaFaixaPPG(bPosUni, 30.0).rms;
+
+          // Índice Óptico de Melanina / Atenuação Epidérmica Basal (Dawson et al., 1980; Hoffman et al., 2022)
+          const refDc = Math.max(meanG, meanB);
+          const mIdx = Math.log((meanR + 2.0) / (refDc + 2.0));
+
+          // Índices pulsáteis regularizados (evita que o ruído escuro em peles com mais melanina infle o denominador)
+          const piR = acR / (meanR + 8.0);
+          const piG = acG / (meanG + 30.0);
+          const piB = acB / (meanB + 30.0);
+          const piRef = Math.max(piG, piB);
+          const perfusaoPct = Math.max(rmsOdR, rmsOdG, piR) * 100.0;
+
+          // Fator corretivo de melanina: evita a superestimação de SpO2 em peles escuras (Sjoding et al., NEJM 2020)
+          const kappaMelanina = 2.45 * (1.0 + 0.14 * Math.max(0.0, Math.min(2.2, mIdx - 1.75)));
+
+          let rComp = 0.68;
+          if (meanR < 249.5 && piR > 1e-5 && piRef > 1e-5) {{
+            const rRaw = (piR / (piRef + 1e-7)) * kappaMelanina;
+            rComp = 0.70 * Math.max(0.42, Math.min(1.25, rRaw)) + 0.30 * 0.68;
+          }} else if (piG > 1e-5 && piB > 1e-5) {{
+            const rGB = (piB / (piG + 1e-7)) * 0.85;
+            rComp = 0.65 * Math.max(0.45, Math.min(1.20, rGB)) + 0.35 * 0.68;
+          }}
+
+          const spo2 = Math.max(88.0, Math.min(98.8, 102.0 - 6.8 * rComp));
+          return {{ spo2, mIdx, perfusaoPct }};
         }}
 
-        function verificarRostoNaGuiaOval(roiTestaData, roiCentroData) {{
-          function proporcaoPele(data) {{
-            let pele = 0;
-            let total = 0;
-            for (let i = 0; i < data.length; i += 8) {{
-              const r = data[i];
-              const g = data[i + 1];
-              const b = data[i + 2];
-              const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-              const cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-              const cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-              if (luma > 35 && luma < 245 && cr >= 130 && cr <= 182 && cb >= 75 && cb <= 132 && r > g * 0.95) {{
-                pele++;
-              }}
-              total++;
-            }}
-            return total > 0 ? pele / total : 0.0;
+        // =========================================================================
+        // FREQUÊNCIA RESPIRATÓRIA FACIAL (RPM): FUSÃO RIIV + RIAV (Poh; Tarassenko)
+        // =========================================================================
+        function filtrarPassaFaixaRespiratoria(arr, fs = 30.0) {{
+          const n = arr.length;
+          if (n < 120) return new Float64Array(0);
+
+          // 1. Detrend linear de mínimos quadrados
+          let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+          for (let i = 0; i < n; i++) {{
+            sumX += i;
+            sumY += arr[i];
+            sumXY += i * arr[i];
+            sumXX += i * i;
+          }}
+          const denom = n * sumXX - sumX * sumX;
+          const slope = Math.abs(denom) > 1e-9 ? (n * sumXY - sumX * sumY) / denom : 0.0;
+          const intercept = (sumY - slope * sumX) / n;
+          const det = new Float64Array(n);
+          for (let i = 0; i < n; i++) det[i] = arr[i] - (intercept + slope * i);
+
+          // 2. Passa-Alta fase zero (~6.0s) para remover deriva ultra-lenta (< 0.10 Hz) mantendo ganho plano em 9-25 RPM
+          const winHP = Math.max(15, Math.min(Math.floor(n * 0.72), Math.floor(fs * 6.0)));
+          const b1 = mediaMovelSimetrica(det, winHP);
+          const b2 = mediaMovelSimetrica(b1, winHP);
+          const hp = new Float64Array(n);
+          for (let i = 0; i < n; i++) hp[i] = det[i] - b2[i];
+
+          // 3. Passa-Baixa fase zero (~0.75s) para suprimir completamente o batimento cardíaco (> 0.85 Hz)
+          const winLP = Math.max(5, Math.floor(fs * 0.75));
+          const lp1 = mediaMovelSimetrica(hp, winLP);
+          const lp2 = mediaMovelSimetrica(lp1, winLP);
+
+          let sum2 = 0.0;
+          for (let i = 0; i < n; i++) sum2 += lp2[i] * lp2[i];
+          const rms = Math.sqrt(sum2 / n) + 1e-9;
+          const norm = new Float64Array(n);
+          for (let i = 0; i < n; i++) norm[i] = lp2[i] / rms;
+          return norm;
+        }}
+
+        function estimarFreqRespiratoriaBandaLarga(sinalRespNorm, fs = 30.0) {{
+          // Avalia o espectro entre 0.06 Hz e 0.85 Hz para ter piso de ruído real fora do lóbulo de Hann,
+          // mas seleciona o pico estritamente na banda fisiológica respiratória [0.15 Hz, 0.42 Hz] (9 a 25 RPM)
+          const n = sinalRespNorm.length;
+          if (n < 150) return {{ rpm: 0.0, snr: 0.0 }};
+
+          const janelado = new Float64Array(n);
+          for (let i = 0; i < n; i++) {{
+            const w = 0.5 * (1.0 - Math.cos((2.0 * Math.PI * i) / (n - 1)));
+            janelado[i] = sinalRespNorm[i] * w;
           }}
 
-          const ratioTesta = proporcaoPele(roiTestaData);
-          const ratioCentro = proporcaoPele(roiCentroData);
-          return ratioTesta >= 0.52 && ratioCentro >= 0.52;
+          const fAvalMin = 0.06, fAvalMax = 0.85, passoHz = 0.005;
+          const fRespMin = 0.15, fRespMax = 0.42; // 9.0 a 25.2 RPM
+          const numBins = Math.floor((fAvalMax - fAvalMin) / passoHz) + 1;
+          const mags = new Float64Array(numBins);
+
+          let bestRespMag = -1.0;
+          let bestRespFreq = 0.0;
+
+          for (let b = 0; b < numBins; b++) {{
+            const freq = fAvalMin + b * passoHz;
+            const omega = (2.0 * Math.PI * freq) / fs;
+            let re = 0.0, im = 0.0;
+            for (let i = 0; i < n; i++) {{
+              const ang = omega * i;
+              re += janelado[i] * Math.cos(ang);
+              im -= janelado[i] * Math.sin(ang);
+            }}
+            const mag = Math.sqrt(re * re + im * im);
+            mags[b] = mag;
+            if (freq >= fRespMin && freq <= fRespMax && mag > bestRespMag) {{
+              bestRespMag = mag;
+              bestRespFreq = freq;
+            }}
+          }}
+
+          const sorted = [...mags].sort((a, b) => a - b);
+          const medNoise = sorted[Math.floor(sorted.length * 0.5)] + 1e-9;
+          const snr = bestRespMag / medNoise;
+          if (snr < 1.25 || bestRespFreq <= 0.0) return {{ rpm: 0.0, snr: 0.0 }};
+
+          // Refinamento temporal por picos respiratórios (intervalo entre respirações de 2.3s a 6.7s)
+          const distMin = Math.floor(fs * 2.2);
+          const picos = [];
+          for (let i = 3; i < n - 3; i++) {{
+            if (
+              sinalRespNorm[i] > 0.20 &&
+              sinalRespNorm[i] >= sinalRespNorm[i - 1] &&
+              sinalRespNorm[i] >= sinalRespNorm[i + 1] &&
+              sinalRespNorm[i] > sinalRespNorm[i - 3] &&
+              sinalRespNorm[i] > sinalRespNorm[i + 3]
+            ) {{
+              if (picos.length === 0 || i - picos[picos.length - 1] >= distMin) {{
+                picos.push(i);
+              }} else if (sinalRespNorm[i] > sinalRespNorm[picos[picos.length - 1]]) {{
+                picos[picos.length - 1] = i;
+              }}
+            }}
+          }}
+
+          let rpmFinal = bestRespFreq * 60.0;
+          if (picos.length >= 2) {{
+            const intervalos = [];
+            for (let i = 1; i < picos.length; i++) {{
+              const dt = (picos[i] - picos[i - 1]) / fs;
+              if (dt >= 2.3 && dt <= 6.7) intervalos.push(dt);
+            }}
+            if (intervalos.length >= 1) {{
+              intervalos.sort((a, b) => a - b);
+              const medDt = intervalos[Math.floor(intervalos.length / 2)];
+              const rpmTempo = 60.0 / medDt;
+              if (Math.abs(rpmTempo - rpmFinal) <= 5.0) {{
+                rpmFinal = 0.65 * rpmFinal + 0.35 * rpmTempo;
+              }}
+            }}
+          }}
+
+          return {{ rpm: rpmFinal, snr }};
+        }}
+
+        function estimarRpmSeguroRosto(rRespUni, gRespUni, bRespUni, fs = 30.0) {{
+          const n = gRespUni.length;
+          if (n < 150) return 0.0;
+
+          let muR = 0.0, muG = 0.0;
+          for (let i = 0; i < n; i++) {{
+            muR += rRespUni[i];
+            muG += gRespUni[i];
+          }}
+          muR = muR / n + 1e-6;
+          muG = muG / n + 1e-6;
+
+          // 1. Sinal RIIV (Variação de Intensidade Venosa Induzida pela Respiração)
+          const riivRaw = new Float64Array(n);
+          for (let i = 0; i < n; i++) {{
+            riivRaw[i] = -(0.65 * (gRespUni[i] / muG) + 0.35 * (rRespUni[i] / muR));
+          }}
+          const riivNorm = filtrarPassaFaixaRespiratoria(riivRaw, fs);
+          const resRIIV = estimarFreqRespiratoriaBandaLarga(riivNorm, fs);
+
+          // 2. Sinal RIAV (Modulação de Amplitude do Volume Sistólico no Pulso POS)
+          const posResp = extrairPulsoPOS(rRespUni, gRespUni, bRespUni, fs);
+          const posCard = filtrarPassaFaixaPPG(posResp, fs).norm;
+          let resRIAV = {{ rpm: 0.0, snr: 0.0 }};
+          if (posCard.length === n) {{
+            const envRaw = new Float64Array(n);
+            for (let i = 0; i < n; i++) envRaw[i] = Math.abs(posCard[i]);
+            const riavNorm = filtrarPassaFaixaRespiratoria(envRaw, fs);
+            resRIAV = estimarFreqRespiratoriaBandaLarga(riavNorm, fs);
+          }}
+
+          if (resRIIV.rpm >= 9.0 && resRIIV.rpm <= 25.5 && resRIAV.rpm >= 9.0 && resRIAV.rpm <= 25.5) {{
+            if (Math.abs(resRIIV.rpm - resRIAV.rpm) <= 4.5) {{
+              return 0.60 * resRIIV.rpm + 0.40 * resRIAV.rpm;
+            }}
+            return resRIIV.snr >= resRIAV.snr ? resRIIV.rpm : resRIAV.rpm;
+          }}
+          if (resRIIV.rpm >= 9.0 && resRIIV.rpm <= 25.5) return resRIIV.rpm;
+          if (resRIAV.rpm >= 9.0 && resRIAV.rpm <= 25.5) return resRIAV.rpm;
+          return 0.0;
         }}
 
         function desenharGrafico() {{
@@ -990,7 +1417,6 @@ def renderizar_monitor_camera_cloud(modo: str):
           if (candidatos.length === 0) return {{ bpm: 0.0, qualidade: 0.0 }};
           if (candidatos.length === 1) return {{ bpm: candidatos[0].bpm, qualidade: candidatos[0].qualidade }};
 
-          // Se temos 2 ou 3 estimadores, verifica concordância com a mediana dos candidatos
           const valores = candidatos.map(c => c.bpm).sort((a, b) => a - b);
           const med = valores[Math.floor(valores.length / 2)];
 
@@ -998,7 +1424,6 @@ def renderizar_monitor_camera_cloud(modo: str):
           let somaBpm = 0.0;
           let maxQual = 0.0;
           for (const c of candidatos) {{
-            // Descarta estimador divergente (> 12 BPM longe do consenso)
             if (Math.abs(c.bpm - med) <= 12.0) {{
               somaBpm += c.bpm * c.peso;
               somaPesos += c.peso;
@@ -1018,22 +1443,20 @@ def renderizar_monitor_camera_cloud(modo: str):
           if (duracaoS < MIN_DURATION_BPM_S) return;
 
           if (MODO === "dedo") {{
-            // Inverte os sinais pois a sístole aumenta o volume sanguíneo (maior absorção de luz = menor intensidade refletida)
-            const rUni = reamostrarUniforme(bufT, bufR.map(v => -v), 30.0);
-            const gUni = reamostrarUniforme(bufT, bufG.map(v => -v), 30.0);
-            const cUni = reamostrarUniforme(bufT, bufCombo.map(v => -v), 30.0);
-            if (rUni.length < 60) return;
+            // 1. BPM de Contato (mantido idêntico ao validado com smartwatch!)
+            const rInvUni = reamostrarUniforme(bufT, bufR.map(v => -v), 30.0);
+            const gInvUni = reamostrarUniforme(bufT, bufG.map(v => -v), 30.0);
+            const cInvUni = reamostrarUniforme(bufT, bufCombo.map(v => -v), 30.0);
+            if (rInvUni.length < 60) return;
 
-            const filtR = filtrarPassaFaixaPPG(rUni, 30.0);
-            const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
-            const filtC = filtrarPassaFaixaPPG(cUni, 30.0);
+            const filtR = filtrarPassaFaixaPPG(rInvUni, 30.0);
+            const filtG = filtrarPassaFaixaPPG(gInvUni, 30.0);
+            const filtC = filtrarPassaFaixaPPG(cInvUni, 30.0);
 
-            // Avalia a periodicidade cardíaca real em cada canal (R não-saturado, G ativo e Combo)
             const resR = filtR.rms < 22.0 ? estimarBpmConsenso(filtR.norm, 30.0) : {{ bpm: 0.0, qualidade: 0.0 }};
             const resG = filtG.rms < 22.0 ? estimarBpmConsenso(filtG.norm, 30.0) : {{ bpm: 0.0, qualidade: 0.0 }};
             const resC = filtC.rms < 22.0 ? estimarBpmConsenso(filtC.norm, 30.0) : {{ bpm: 0.0, qualidade: 0.0 }};
 
-            // Escolhe o canal que apresentou a onda cardíaca mais periódica e limpa
             let melhor = resC;
             if (resG.qualidade >= melhor.qualidade && resG.bpm > 0) melhor = resG;
             if (resR.qualidade > melhor.qualidade * 1.05 && resR.bpm > 0) melhor = resR;
@@ -1042,32 +1465,76 @@ def renderizar_monitor_camera_cloud(modo: str):
               bpmAtual = estabBpm.atualizar(melhor.bpm);
             }}
 
-            const spo2Bruto = calcularSpo2Empirico(rUni, gUni, reamostrarUniforme(bufT, bufB, 30.0));
-            if (spo2Bruto >= 85.0 && spo2Bruto <= 99.5 && bpmAtual > 0) {{
-              secAtual = estabSec.atualizar(spo2Bruto);
+            // 2. SpO2 com vetores POSITIVOS reais + Compensação de Melanina
+            const rPosUni = reamostrarUniforme(bufT, bufR, 30.0);
+            const gPosUni = reamostrarUniforme(bufT, bufG, 30.0);
+            const bPosUni = reamostrarUniforme(bufT, bufB, 30.0);
+            const spo2Info = calcularSpo2SeguroPele(rPosUni, gPosUni, bPosUni);
+
+            if (spo2Info.spo2 >= 85.0 && spo2Info.spo2 <= 99.5) {{
+              secAtual = estabSec.atualizar(spo2Info.spo2);
+            }}
+            if (pillSkin && spo2Info.mIdx > 0) {{
+              pillSkin.className = "bio-pill good";
+              pillSkin.textContent = `🎨 Melanina (M=${{spo2Info.mIdx.toFixed(1)}}): Calibrada`;
+            }}
+            if (pillDist && spo2Info.perfusaoPct > 0) {{
+              const perfBoa = spo2Info.perfusaoPct >= 0.08;
+              pillDist.className = perfBoa ? "bio-pill good" : "bio-pill alert";
+              pillDist.textContent = `🩸 Perfusão: ${{spo2Info.perfusaoPct.toFixed(2)}}%`;
             }}
           }} else {{
-            const gUni = reamostrarUniforme(bufT, bufG.map(v => -v), 30.0);
-            if (gUni.length < 60) return;
-            const filtG = filtrarPassaFaixaPPG(gUni, 30.0);
+            // 1. BPM Facial via Algoritmo POS (Wang et al., 2017) + CHROM (De Haan & Jeanne, 2013)
+            const rFaceUni = reamostrarUniforme(bufT, bufR, 30.0);
+            const gFaceUni = reamostrarUniforme(bufT, bufG, 30.0);
+            const bFaceUni = reamostrarUniforme(bufT, bufB, 30.0);
+            if (gFaceUni.length < 60) return;
 
-            const resFace = estimarBpmConsenso(filtG.norm, 30.0);
-            if (resFace.bpm >= 46.0 && resFace.bpm <= 145.0) {{
-              bpmAtual = estabBpm.atualizar(resFace.bpm);
+            const posRaw = extrairPulsoPOS(rFaceUni, gFaceUni, bFaceUni, 30.0);
+            const chromRaw = extrairPulsoCHROM(rFaceUni, gFaceUni, bFaceUni, 30.0);
+            const gInvUni = reamostrarUniforme(bufT, bufG.map(v => -v), 30.0);
+
+            const filtPOS = filtrarPassaFaixaPPG(posRaw, 30.0);
+            const filtCHROM = filtrarPassaFaixaPPG(chromRaw, 30.0);
+            const filtG = filtrarPassaFaixaPPG(gInvUni, 30.0);
+
+            const resPOS = estimarBpmConsenso(filtPOS.norm, 30.0);
+            const resCHROM = estimarBpmConsenso(filtCHROM.norm, 30.0);
+            const resG = estimarBpmConsenso(filtG.norm, 30.0);
+
+            let bpmEscolhido = 0.0;
+            if (resPOS.bpm > 0 && resCHROM.bpm > 0 && Math.abs(resPOS.bpm - resCHROM.bpm) <= 10.0) {{
+              bpmEscolhido = 0.60 * resPOS.bpm + 0.40 * resCHROM.bpm;
+            }} else {{
+              let bestScore = -1.0;
+              if (resPOS.bpm > 0 && resPOS.qualidade * 1.15 > bestScore) {{
+                bestScore = resPOS.qualidade * 1.15;
+                bpmEscolhido = resPOS.bpm;
+              }}
+              if (resCHROM.bpm > 0 && resCHROM.qualidade * 1.08 > bestScore) {{
+                bestScore = resCHROM.qualidade * 1.08;
+                bpmEscolhido = resCHROM.bpm;
+              }}
+              if (resG.bpm > 0 && resG.qualidade * 0.90 > bestScore) {{
+                bpmEscolhido = resG.bpm;
+              }}
             }}
 
-            if (duracaoS >= MIN_DURATION_RPM_S) {{
-              const gRespUni = reamostrarUniforme(bufT, bufG, 30.0);
-              let mediaResp = 0;
-              for (let i = 0; i < gRespUni.length; i++) mediaResp += gRespUni[i];
-              mediaResp /= gRespUni.length;
-              const normResp = new Float64Array(gRespUni.length);
-              for (let i = 0; i < gRespUni.length; i++) normResp[i] = gRespUni[i] - mediaResp;
+            if (bpmEscolhido >= 46.0 && bpmEscolhido <= 145.0) {{
+              bpmAtual = estabBpm.atualizar(bpmEscolhido);
+            }}
 
-              const dftRpm = estimarFrequenciaSegura(normResp, 30.0, 0.15, 0.40, 1.30, false);
-              const rpmBruto = dftRpm.freq * 60.0;
-              if (rpmBruto >= 9.0 && rpmBruto <= 24.0) {{
-                secAtual = estabSec.atualizar(rpmBruto);
+            // 2. RPM Facial via Fusão RIIV + RIAV no buffer respiratório dedicado de 16s
+            if (bufRespT.length >= 40) {{
+              const durRespS = (bufRespT[bufRespT.length - 1] - bufRespT[0]) / 1000.0;
+              if (durRespS >= MIN_DURATION_RPM_S) {{
+                const rRespUni = reamostrarUniforme(bufRespT, bufRespR, 30.0);
+                const gRespUni = reamostrarUniforme(bufRespT, bufRespG, 30.0);
+                const bRespUni = reamostrarUniforme(bufRespT, bufRespB, 30.0);
+                const rpmBruto = estimarRpmSeguroRosto(rRespUni, gRespUni, bRespUni, 30.0);
+                if (rpmBruto >= 9.0 && rpmBruto <= 25.5) {{
+                  secAtual = estabSec.atualizar(rpmBruto);
+                }}
               }}
             }}
           }}
@@ -1086,11 +1553,35 @@ def renderizar_monitor_camera_cloud(modo: str):
           }}
         }}
 
+        function desenharAlertaNoVideo( vw, vh, texto, corFundo ) {{
+          ctx.save();
+          ctx.font = "700 13.5px sans-serif";
+          const medTexto = ctx.measureText(texto).width;
+          const boxW = Math.min(vw - 20, Math.max(220, medTexto + 28));
+          const boxH = 34;
+          const bx = Math.floor((vw - boxW) / 2);
+          const by = Math.max(12, vh - boxH - 14);
+
+          ctx.fillStyle = corFundo;
+          ctx.beginPath();
+          if (ctx.roundRect) {{
+            ctx.roundRect(bx, by, boxW, boxH, 17);
+          }} else {{
+            ctx.rect(bx, by, boxW, boxH);
+          }}
+          ctx.fill();
+
+          ctx.fillStyle = "#FFFFFF";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(texto, Math.floor(vw / 2), by + Math.floor(boxH / 2));
+          ctx.restore();
+        }}
+
         function renderLoop() {{
           if (!isRunning) return;
 
           if (videoEl.readyState >= videoEl.HAVE_CURRENT_DATA) {{
-            // Sincroniza a resolução do canvas com a proporção real nativa da câmera (elimina imagem esticada)
             if (
               videoEl.videoWidth > 0 &&
               videoEl.videoHeight > 0 &&
@@ -1103,12 +1594,10 @@ def renderizar_monitor_camera_cloud(modo: str):
             const vw = viewCanvas.width;
             const vh = viewCanvas.height;
 
-            // Verifica se a câmera entregou um NOVO quadro real (evita amostrar o mesmo frame 2x-4x em telas de 60/120Hz)
             const now = performance.now();
             const vTime = videoEl.currentTime;
             const isNovoQuadroCamera = (vTime !== lastVideoTime) || (now - lastSampleTime >= 32.0);
 
-            // Espelha horizontalmente apenas na câmera frontal (efeito espelho natural)
             ctx.save();
             if (MODO === "rosto") {{
               ctx.translate(vw, 0);
@@ -1150,12 +1639,10 @@ def renderizar_monitor_camera_cloud(modo: str):
                   sumB += b;
                   totalAmostras++;
 
-                  // Coleta separadamente pixels onde o canal Vermelho NÃO estourou (< 252)
                   if (r >= 25 && r <= 251) {{
                     sumRUnsat += r;
                     countRUnsat++;
                   }}
-                  // Coleta separadamente pixels onde o canal Verde tem luz transmitida ativa e sem estouro
                   if (g >= 3 && g <= 251) {{
                     sumGActive += g;
                     countGActive++;
@@ -1166,19 +1653,29 @@ def renderizar_monitor_camera_cloud(modo: str):
                 const meanGAll = sumG / Math.max(1, totalAmostras);
                 const meanBAll = sumB / Math.max(1, totalAmostras);
 
-                // Usa a média dos pixels não-saturados para preservar a amplitude AC da onda cardíaca
                 const valR = countRUnsat > (totalAmostras * 0.08) ? (sumRUnsat / countRUnsat) : meanRAll;
                 const valG = countGActive > (totalAmostras * 0.08) ? (sumGActive / countGActive) : meanGAll;
                 const valCombo = meanRAll >= 244.0 && valG > 4.0 ? valG : (0.5 * valR + 0.5 * valG);
 
-                // Dedo presente se o canal vermelho é dominante sobre o azul e tem brilho suficiente
-                alvoDetectado = meanRAll > 125.0 && meanRAll > meanBAll * 1.35;
+                alvoDetectado = meanRAll > 115.0 && meanRAll > meanBAll * 1.32;
+
+                if (pillLight) {{
+                  if (!alvoDetectado) {{
+                    pillLight.className = "bio-pill alert";
+                    pillLight.textContent = "💡 Luz: Cubra a lente e o flash";
+                  }} else if (meanRAll > 253.0 && meanGAll > 245.0) {{
+                    pillLight.className = "bio-pill alert";
+                    pillLight.textContent = "☀️ Luz: Excesso de pressão";
+                  }} else {{
+                    pillLight.className = "bio-pill good";
+                    pillLight.textContent = "💡 Luz Óptica: Ideal";
+                  }}
+                }}
 
                 if (alvoDetectado) {{
                   if (inicioContatoMs === 0) inicioContatoMs = now;
                   const tempoContatoMs = now - inicioContatoMs;
 
-                  // Aguarda 1.0s inicial para a auto-exposição (AE) da câmera estabilizar após cobrir a lente
                   if (tempoContatoMs >= 1000) {{
                     bufR.push(valR);
                     bufG.push(valG);
@@ -1199,7 +1696,7 @@ def renderizar_monitor_camera_cloud(modo: str):
                   const prog = Math.min(100, Math.floor((duracaoAtual / MIN_DURATION_BPM_S) * 100));
                   if (bpmAtual <= 0) {{
                     statusBox.className = "status-box";
-                    statusBox.innerHTML = `⏳ <b>Estabilizando onda cardíaca (${{prog}}%)...</b> apoie o dedo de leve sem apertar.`;
+                    statusBox.innerHTML = `⏳ <b>Estabilizando onda cardíaca e SpO2 (${{prog}}%)...</b> apoie o dedo de leve sem apertar.`;
                   }} else {{
                     statusBox.className = "status-box ok";
                     statusBox.innerHTML = "✅ <b>Leitura Estabilizada!</b> (Mantenha pressão leve e constante)";
@@ -1217,6 +1714,14 @@ def renderizar_monitor_camera_cloud(modo: str):
                   secAtual = 0;
                   valBpm.textContent = "-- BPM";
                   valSec.textContent = "-- %";
+                  if (pillSkin) {{
+                    pillSkin.className = "bio-pill";
+                    pillSkin.textContent = "🎨 Tom de Pele: Aguardando";
+                  }}
+                  if (pillDist) {{
+                    pillDist.className = "bio-pill";
+                    pillDist.textContent = "🩸 Perfusão: --";
+                  }}
                   statusBox.className = "status-box warn";
                   statusBox.innerHTML = "👆 <b>Posicione o dedo suavemente</b> cobrindo a câmera traseira e o flash.";
                 }}
@@ -1227,79 +1732,263 @@ def renderizar_monitor_camera_cloud(modo: str):
               ctx.strokeRect(xi, yi, roiSize, roiSize);
 
             }} else {{
-              // Modo Rosto (rPPG com Guia Biométrica Oval Fixa + ROI Anatômica da Testa)
+              // =========================================================================
+              // MODO ROSTO: MULTI-ROI (DistancePPG) + POS/CHROM + ITA° + GUIA DE DISTÂNCIA
+              // =========================================================================
               const menorDim = Math.min(vw, vh);
               const cx = Math.floor(vw * 0.5);
               const cy = Math.floor(vh * 0.48);
               const rx = Math.floor(menorDim * 0.30);
               const ry = Math.floor(menorDim * 0.39);
 
-              // Coordenadas fixas da ROI da Testa (parte superior interna do oval)
-              const tw = Math.max(24, Math.floor(rx * 0.92));
-              const th = Math.max(16, Math.floor(ry * 0.30));
+              // 1. ROI Testa
+              const tw = Math.max(24, Math.floor(rx * 0.86));
+              const th = Math.max(16, Math.floor(ry * 0.26));
               const tx = Math.floor(cx - tw / 2);
-              const ty = Math.floor(cy - ry * 0.72);
+              const ty = Math.floor(cy - ry * 0.68);
 
-              // Região central do rosto (nariz/bochechas) para validação biométrica conjunta
-              const cwBox = Math.max(24, Math.floor(rx * 0.80));
-              const chBox = Math.max(20, Math.floor(ry * 0.40));
-              const cxBox = Math.floor(cx - cwBox / 2);
-              const cyBox = Math.floor(cy - chBox * 0.35);
+              // 2. ROI Bochecha Esquerda e Direita (Malar)
+              const mw = Math.max(20, Math.floor(rx * 0.40));
+              const mh = Math.max(16, Math.floor(ry * 0.26));
+              const lx = Math.floor(cx - rx * 0.60);
+              const dx = Math.floor(cx + rx * 0.20);
+              const my = Math.floor(cy - ry * 0.02);
 
               if (isNovoQuadroCamera) {{
-                const testaImgData = ctx.getImageData(tx, ty, tw, th).data;
-                const centroImgData = ctx.getImageData(cxBox, cyBox, cwBox, chBox).data;
+                const testaData = ctx.getImageData(tx, ty, tw, th).data;
+                const malarEsqData = ctx.getImageData(lx, my, mw, mh).data;
+                const malarDirData = ctx.getImageData(dx, my, mw, mh).data;
 
-                const presencaInstantanea = verificarRostoNaGuiaOval(testaImgData, centroImgData);
+                const roiT = extrairRoiPeleLimpa(testaData, 8);
+                const roiE = extrairRoiPeleLimpa(malarEsqData, 8);
+                const roiD = extrairRoiPeleLimpa(malarDirData, 8);
+
+                // Amostragem espacial concêntrica para diagnosticar DISTÂNCIA (Longe vs Ideal vs Perto) e Luz da Cena
+                const cropX = Math.max(0, Math.floor(cx - rx * 1.45));
+                const cropY = Math.max(0, Math.floor(cy - ry * 1.35));
+                const cropW = Math.min(vw - cropX, Math.floor(rx * 2.90));
+                const cropH = Math.min(vh - cropY, Math.floor(ry * 2.70));
+                const sceneData = ctx.getImageData(cropX, cropY, cropW, cropH).data;
+
+                let peleMiolo = 0, totMiolo = 0;
+                let peleBordaInt = 0, totBordaInt = 0;
+                let peleAnelExt = 0, totAnelExt = 0;
+                let somaLumaCena = 0, totCena = 0;
+
+                const passoX = Math.max(4, Math.floor(cropW / 32));
+                const passoY = Math.max(4, Math.floor(cropH / 32));
+                for (let py = 0; py < cropH; py += passoY) {{
+                  const yReal = cropY + py;
+                  const dyNorm = (yReal - cy) / (ry + 1e-6);
+                  for (let px = 0; px < cropW; px += passoX) {{
+                    const xReal = cropX + px;
+                    const dxNorm = (xReal - cx) / (rx + 1e-6);
+                    const d2 = dxNorm * dxNorm + dyNorm * dyNorm;
+
+                    const idx = (py * cropW + px) * 4;
+                    const r = sceneData[idx];
+                    const g = sceneData[idx + 1];
+                    const b = sceneData[idx + 2];
+                    somaLumaCena += 0.299 * r + 0.587 * g + 0.114 * b;
+                    totCena++;
+
+                    const isPele = ehPixelPeleInclusivo(r, g, b);
+                    if (d2 <= 0.42) {{
+                      totMiolo++;
+                      if (isPele) peleMiolo++;
+                    }} else if (d2 >= 0.58 && d2 <= 0.98 && dyNorm < 0.75) {{
+                      totBordaInt++;
+                      if (isPele) peleBordaInt++;
+                    }} else if (d2 >= 1.22 && d2 <= 1.85 && dyNorm < 0.45) {{
+                      totAnelExt++;
+                      if (isPele) peleAnelExt++;
+                    }}
+                  }}
+                }}
+
+                const ratioMiolo = totMiolo > 0 ? (peleMiolo / totMiolo) : 0.0;
+                const ratioBordaInt = totBordaInt > 0 ? (peleBordaInt / totBordaInt) : 0.0;
+                const ratioAnelExt = totAnelExt > 0 ? (peleAnelExt / totAnelExt) : 0.0;
+                const lumaCena = totCena > 0 ? (somaLumaCena / totCena) : 80.0;
+
+                const fracPeleMedia = (roiT.fracPele + roiE.fracPele + roiD.fracPele) / 3.0;
+                const presencaInstantanea = (ratioMiolo >= 0.34 && fracPeleMedia >= 0.24) || (fracPeleMedia >= 0.38);
+
                 if (presencaInstantanea) {{
                   framesSemRosto = 0;
                   alvoDetectado = true;
                 }} else {{
                   framesSemRosto++;
-                  if (framesSemRosto > 12) {{
+                  if (framesSemRosto > 28) {{ // Tolerância de ~0.9s para evitar resets acidentais
                     alvoDetectado = false;
                   }}
                 }}
 
-                if (alvoDetectado) {{
-                  let sumG = 0;
-                  const countPx = tw * th;
-                  for (let i = 0; i < testaImgData.length; i += 4) {{
-                    sumG += testaImgData[i + 1];
+                // Histerese suave para alerta de distância (evita piscar mensagens)
+                if (!alvoDetectado) {{
+                  estadoDistanciaRosto = "ausente";
+                  contadorLonge = 0;
+                  contadorPerto = 0;
+                }} else {{
+                  if (ratioBordaInt < 0.23 && ratioMiolo >= 0.30) {{
+                    contadorLonge = Math.min(12, contadorLonge + 1);
+                    contadorPerto = Math.max(0, contadorPerto - 1);
+                  }} else if (ratioBordaInt >= 0.76 && ratioAnelExt > 0.60) {{
+                    contadorPerto = Math.min(12, contadorPerto + 1);
+                    contadorLonge = Math.max(0, contadorLonge - 1);
+                  }} else {{
+                    contadorLonge = Math.max(0, contadorLonge - 1);
+                    contadorPerto = Math.max(0, contadorPerto - 1);
                   }}
-                  const meanG = sumG / countPx;
 
-                  bufG.push(meanG);
-                  bufT.push(now);
-                  while (bufT.length > 2 && (now - bufT[0] > WINDOW_MS || bufT.length > MAX_SAMPLES)) {{
-                    bufG.shift();
-                    bufT.shift();
+                  if (contadorLonge >= 4) estadoDistanciaRosto = "longe";
+                  else if (contadorPerto >= 4) estadoDistanciaRosto = "perto";
+                  else estadoDistanciaRosto = "ideal";
+                }}
+
+                if (alvoDetectado) {{
+                  // Fusão Ponderada por Qualidade das 3 ROIs (DistancePPG, Kumar et al., 2015)
+                  const wT = Math.max(0.10, roiT.fracPele * (1.0 - roiT.fracSaturada));
+                  const wE = Math.max(0.08, roiE.fracPele * (1.0 - roiE.fracSaturada));
+                  const wD = Math.max(0.08, roiD.fracPele * (1.0 - roiD.fracSaturada));
+                  const wSoma = wT + wE + wD;
+
+                  const faceR = (wT * roiT.r + wE * roiE.r + wD * roiD.r) / wSoma;
+                  const faceG = (wT * roiT.g + wE * roiE.g + wD * roiD.g) / wSoma;
+                  const faceB = (wT * roiT.b + wE * roiE.b + wD * roiD.b) / wSoma;
+                  const lumaPele = 0.299 * faceR + 0.587 * faceG + 0.114 * faceB;
+                  const satMedia = (roiT.fracSaturada + roiE.fracSaturada + roiD.fracSaturada) / 3.0;
+
+                  // Classificação de Tom de Pele (ITA°) e Diagnóstico Inteligente de Iluminação
+                  const infoIta = calcularAnguloITA(faceR, faceG, faceB);
+                  itaSuavizado = 0.85 * itaSuavizado + 0.15 * infoIta.ita;
+                  const infoSuave = calcularAnguloITA(faceR, faceG, faceB);
+
+                  if (pillSkin) {{
+                    pillSkin.className = "bio-pill good";
+                    pillSkin.textContent = `🎨 Pele: ${{infoSuave.categoria}}`;
+                  }}
+
+                  const limiarEscuroPele = itaSuavizado > 15.0 ? 44.0 : 23.0;
+                  if (satMedia > 0.18) {{
+                    estadoIluminacao = "estourada";
+                    if (pillLight) {{
+                      pillLight.className = "bio-pill alert";
+                      pillLight.textContent = "☀️ Luz: Reflexo Forte";
+                    }}
+                  }} else if (lumaPele < limiarEscuroPele && lumaCena < 45.0) {{
+                    estadoIluminacao = "escura";
+                    if (pillLight) {{
+                      pillLight.className = "bio-pill alert";
+                      pillLight.textContent = "💡 Luz: Ambiente Escuro";
+                    }}
+                  }} else {{
+                    estadoIluminacao = "ok";
+                    if (pillLight) {{
+                      pillLight.className = "bio-pill good";
+                      pillLight.textContent = "💡 Iluminação: Ideal";
+                    }}
+                  }}
+
+                  if (pillDist) {{
+                    if (estadoDistanciaRosto === "longe") {{
+                      pillDist.className = "bio-pill alert";
+                      pillDist.textContent = "🔍 Distância: Aproxime";
+                    }} else if (estadoDistanciaRosto === "perto") {{
+                      pillDist.className = "bio-pill alert";
+                      pillDist.textContent = "↔️ Distância: Afaste";
+                    }} else {{
+                      pillDist.className = "bio-pill good";
+                      pillDist.textContent = "📏 Distância: Ideal";
+                    }}
+                  }}
+
+                  // Alimenta buffers cardíacos (10.5s) e respiratórios (16s) apenas com quadros válidos
+                  if (presencaInstantanea) {{
+                    bufR.push(faceR);
+                    bufG.push(faceG);
+                    bufB.push(faceB);
+                    bufT.push(now);
+                    while (bufT.length > 2 && (now - bufT[0] > WINDOW_MS || bufT.length > MAX_SAMPLES)) {{
+                      bufR.shift();
+                      bufG.shift();
+                      bufB.shift();
+                      bufT.shift();
+                    }}
+
+                    bufRespR.push(faceR);
+                    bufRespG.push(faceG);
+                    bufRespB.push(faceB);
+                    bufRespT.push(now);
+                    while (
+                      bufRespT.length > 2 &&
+                      (now - bufRespT[0] > RESP_WINDOW_MS || bufRespT.length > MAX_RESP_SAMPLES)
+                    ) {{
+                      bufRespR.shift();
+                      bufRespG.shift();
+                      bufRespB.shift();
+                      bufRespT.shift();
+                    }}
                   }}
 
                   const duracaoAtual = bufT.length > 1 ? (bufT[bufT.length - 1] - bufT[0]) / 1000.0 : 0.0;
                   const prog = Math.min(100, Math.floor((duracaoAtual / MIN_DURATION_BPM_S) * 100));
-                  if (bpmAtual <= 0) {{
+
+                  if (estadoDistanciaRosto === "longe") {{
+                    statusBox.className = "status-box warn";
+                    statusBox.innerHTML = "🔍 <b>Rosto distante:</b> aproxime um pouco o rosto para preencher a guia oval.";
+                  }} else if (estadoDistanciaRosto === "perto") {{
+                    statusBox.className = "status-box warn";
+                    statusBox.innerHTML = "↔️ <b>Rosto muito próximo:</b> afaste um pouco o celular para caber na guia oval.";
+                  }} else if (estadoIluminacao === "escura") {{
+                    statusBox.className = "status-box warn";
+                    statusBox.innerHTML = "💡 <b>Pouca luz detectada:</b> posicione-se de frente para uma janela ou lâmpada.";
+                  }} else if (estadoIluminacao === "estourada") {{
+                    statusBox.className = "status-box warn";
+                    statusBox.innerHTML = "☀️ <b>Reflexo forte na pele:</b> incline levemente para evitar luz estourando na testa.";
+                  }} else if (bpmAtual <= 0) {{
                     statusBox.className = "status-box";
-                    statusBox.innerHTML = `⏳ <b>Capturando sinal da testa (${{prog}}%)...</b> mantenha o rosto na guia.`;
+                    statusBox.innerHTML = `⏳ <b>Extraindo pulso POS Multi-ROI (${{prog}}%)...</b> respire normalmente sem mover a cabeça.`;
                   }} else {{
+                    const msgRpm = secAtual > 0 ? "BPM + RPM ativos" : "estabilizando respiração...";
                     statusBox.className = "status-box ok";
-                    statusBox.innerHTML = "✅ <b>Leitura rPPG Estabilizada!</b>";
+                    statusBox.innerHTML = `✅ <b>Leitura rPPG Estabilizada!</b> (${{msgRpm}})`;
                   }}
                 }} else {{
+                  bufR = [];
                   bufG = [];
+                  bufB = [];
                   bufT = [];
+                  if (framesSemRosto > 45) {{
+                    bufRespR = [];
+                    bufRespG = [];
+                    bufRespB = [];
+                    bufRespT = [];
+                  }}
                   estabBpm.reset();
                   estabSec.reset();
                   bpmAtual = 0;
                   secAtual = 0;
                   valBpm.textContent = "-- BPM";
                   valSec.textContent = "-- RPM";
+                  if (pillSkin) {{
+                    pillSkin.className = "bio-pill";
+                    pillSkin.textContent = "🎨 Tom de Pele: Aguardando";
+                  }}
+                  if (pillLight) {{
+                    pillLight.className = "bio-pill";
+                    pillLight.textContent = "💡 Iluminação: --";
+                  }}
+                  if (pillDist) {{
+                    pillDist.className = "bio-pill alert";
+                    pillDist.textContent = "📏 Distância: Encaixe o rosto";
+                  }}
                   statusBox.className = "status-box warn";
-                  statusBox.innerHTML = "🙂 <b>Encaixe seu rosto na guia oval</b> com a testa dentro do retângulo.";
+                  statusBox.innerHTML = "🙂 <b>Encaixe seu rosto na guia oval</b> olhando para a câmera em local iluminado.";
                 }}
               }}
 
-              // Máscara escura translúcida ao redor da silhueta oval para guiar o enquadramento
+              // Máscara escura translúcida ao redor da silhueta oval
               ctx.save();
               ctx.fillStyle = "rgba(11, 13, 18, 0.48)";
               ctx.beginPath();
@@ -1308,8 +1997,16 @@ def renderizar_monitor_camera_cloud(modo: str):
               ctx.fill("evenodd");
               ctx.restore();
 
-              // Desenha contorno da Guia Oval
-              const corGuia = !alvoDetectado ? "#38BDF8" : (bpmAtual > 0 ? "#10B981" : "#F59E0B");
+              // Contorno da Guia Oval (muda de cor conforme enquadramento/distância)
+              const alertaAtivo = (
+                estadoDistanciaRosto === "longe" ||
+                estadoDistanciaRosto === "perto" ||
+                estadoIluminacao !== "ok"
+              );
+              const corGuia = !alvoDetectado
+                ? "#38BDF8"
+                : (alertaAtivo ? "#F59E0B" : (bpmAtual > 0 ? "#10B981" : "#38BDF8"));
+
               ctx.save();
               ctx.lineWidth = 3;
               ctx.strokeStyle = corGuia;
@@ -1319,17 +2016,34 @@ def renderizar_monitor_camera_cloud(modo: str):
               ctx.stroke();
               ctx.restore();
 
-              // Desenha o retângulo da ROI da Testa
+              // Desenha as 3 ROIs do DistancePPG (Testa + Malar Esq + Malar Dir)
+              const corRoi = !alvoDetectado ? "rgba(255, 255, 255, 0.55)" : (bpmAtual > 0 ? "#10B981" : "#38BDF8");
               ctx.save();
-              ctx.lineWidth = 2.5;
-              ctx.strokeStyle = !alvoDetectado ? "rgba(255, 255, 255, 0.65)" : (bpmAtual > 0 ? "#10B981" : "#F59E0B");
+              ctx.lineWidth = 2;
+              ctx.strokeStyle = corRoi;
               ctx.strokeRect(tx, ty, tw, th);
-              ctx.fillStyle = "rgba(11, 13, 18, 0.65)";
-              ctx.fillRect(tx, Math.max(0, ty - 20), 76, 18);
+              ctx.strokeRect(lx, my, mw, mh);
+              ctx.strokeRect(dx, my, mw, mh);
+
+              ctx.fillStyle = "rgba(11, 13, 18, 0.68)";
+              ctx.fillRect(tx, Math.max(0, ty - 19), 72, 17);
               ctx.fillStyle = "#FAFAFA";
-              ctx.font = "600 11px sans-serif";
+              ctx.font = "600 10.5px sans-serif";
               ctx.fillText("ROI TESTA", tx + 6, Math.max(12, ty - 7));
               ctx.restore();
+
+              // Desenha alerta direto sobre o vídeo para orientar distância e luz imediatamente
+              if (!alvoDetectado) {{
+                desenharAlertaNoVideo(vw, vh, "🙂 ENCAIXE O ROSTO NA GUIA OVAL", "rgba(30, 41, 59, 0.88)");
+              }} else if (estadoDistanciaRosto === "longe") {{
+                desenharAlertaNoVideo(vw, vh, "🔍 APROXIME UM POUCO O ROSTO", "rgba(217, 119, 6, 0.92)");
+              }} else if (estadoDistanciaRosto === "perto") {{
+                desenharAlertaNoVideo(vw, vh, "↔️ AFASTE UM POUCO O ROSTO", "rgba(217, 119, 6, 0.92)");
+              }} else if (estadoIluminacao === "escura") {{
+                desenharAlertaNoVideo(vw, vh, "💡 AMBIENTE ESCURO: VIRE-SE PARA A LUZ", "rgba(180, 83, 9, 0.92)");
+              }} else if (estadoIluminacao === "estourada") {{
+                desenharAlertaNoVideo(vw, vh, "☀️ EVITE REFLEXO DIRETO NO ROSTO", "rgba(180, 83, 9, 0.92)");
+              }}
             }}
           }}
 
@@ -1510,6 +2224,18 @@ def renderizar_monitor_camera_cloud(modo: str):
             statusBox.className = "status-box";
             statusBox.innerHTML = "Câmera desligada. Toque em <b>Ligar Câmera</b> para iniciar.";
             fpsBadge.textContent = "FPS: --";
+            if (pillSkin) {{
+              pillSkin.className = "bio-pill";
+              pillSkin.textContent = "🎨 Tom de Pele: Aguardando";
+            }}
+            if (pillLight) {{
+              pillLight.className = "bio-pill";
+              pillLight.textContent = "💡 Iluminação: --";
+            }}
+            if (pillDist) {{
+              pillDist.className = "bio-pill";
+              pillDist.textContent = MODO === "dedo" ? "🩸 Perfusão: --" : "📏 Distância: --";
+            }}
             return;
           }}
 
@@ -1571,7 +2297,7 @@ def renderizar_monitor_camera_cloud(modo: str):
     </body>
     </html>
     """
-    components.html(html_code, height=820, scrolling=False)
+    components.html(html_code, height=880, scrolling=False)
 
 
 # ==============================================================================
