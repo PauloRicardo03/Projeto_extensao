@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Variáveis de ambiente e segredos do Streamlit (NUNCA subir para o GitHub)
+.env
+.streamlit/secrets.toml
+
+# Sistema / IDE
+.DS_Store
+Thumbs.db
+.vscode/
